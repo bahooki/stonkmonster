@@ -84,6 +84,7 @@ def build_dataset(payload: BuildDatasetRequest) -> dict[str, object]:
             refresh_prices=payload.refresh_prices,
             dataset_name=payload.dataset_name,
             politician_trades_csv=payload.politician_trades_csv,
+            universe=payload.universe,
             years_ago_start=payload.years_ago_start,
             years_ago_end=payload.years_ago_end,
         )
@@ -124,9 +125,19 @@ def backtest(payload: BacktestRequest) -> dict[str, object]:
         results = service.backtest(
             dataset_name=payload.dataset_name,
             interval=payload.interval,
+            mode=payload.mode,
             long_threshold=payload.long_threshold,
             short_threshold=payload.short_threshold,
             fee_bps=payload.fee_bps,
+            use_model_thresholds=payload.use_model_thresholds,
+            spread_bps=payload.spread_bps,
+            slippage_bps=payload.slippage_bps,
+            short_borrow_bps_per_day=payload.short_borrow_bps_per_day,
+            latency_bars=payload.latency_bars,
+            train_window_days=payload.train_window_days,
+            test_window_days=payload.test_window_days,
+            step_days=payload.step_days,
+            min_pattern_rows=payload.min_pattern_rows,
             include_patterns=set(payload.include_patterns or []) or None,
             include_model_files=set(payload.include_model_files or []) or None,
         )
@@ -151,6 +162,10 @@ def scan(payload: ScanRequest) -> dict[str, object]:
             include_patterns=set(payload.include_patterns or []) or None,
             include_model_files=set(payload.include_model_files or []) or None,
             min_confidence=payload.min_confidence,
+            use_model_thresholds=payload.use_model_thresholds,
+            long_threshold=payload.long_threshold,
+            short_threshold=payload.short_threshold,
+            universe=payload.universe,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -222,6 +237,7 @@ def interval_sweep(payload: SweepIntervalsRequest) -> dict[str, object]:
             refresh_prices=payload.refresh_prices,
             base_dataset_name=payload.base_dataset_name,
             politician_trades_csv=payload.politician_trades_csv,
+            universe=payload.universe,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

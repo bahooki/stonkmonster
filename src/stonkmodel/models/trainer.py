@@ -6,6 +6,11 @@ import numpy as np
 import pandas as pd
 
 from stonkmodel.features.dataset import get_pattern_datasets, split_xy
+from stonkmodel.models.calibration import (
+    apply_probability_calibration,
+    fit_probability_calibration,
+    optimize_thresholds_from_validation,
+)
 from stonkmodel.models.feature_selection import FeatureSelectionConfig, select_features
 from stonkmodel.models.importance import ImportanceConfig, compute_permutation_feature_importance
 from stonkmodel.models.stacking import (
@@ -26,6 +31,7 @@ class TrainConfig:
     max_feature_correlation: float = 0.995
     min_selected_features: int = 25
     max_selected_features: int = 260
+    calibration_fraction: float = 0.2
 
 
 class PatternTrainer:
@@ -59,6 +65,8 @@ class PatternTrainer:
                     "dropped_constant",
                     "dropped_correlated",
                     "dropped_low_importance",
+                    "tuned_long_threshold",
+                    "tuned_short_threshold",
                     "top_features",
                     "importance_path",
                 ]
@@ -80,6 +88,12 @@ class PatternTrainer:
         if train.empty or test.empty:
             return None
 
+        train_dt = pd.to_datetime(train["datetime"], utc=True, errors="coerce")
+        test_dt = pd.to_datetime(test["datetime"], utc=True, errors="coerce")
+        train_end_datetime = train_dt.max()
+        test_start_datetime = test_dt.min()
+
+        train = train.sort_values("datetime").reset_index(drop=True)
         x_train_raw, y_train, feature_cols_raw = split_xy(train)
         selection = select_features(
             x_train=x_train_raw,
@@ -96,19 +110,52 @@ class PatternTrainer:
         if not feature_cols:
             return None
 
-        x_train = x_train_raw[feature_cols].copy()
-        x_test = test.reindex(columns=feature_cols).copy()
-        x_test = x_test.fillna(x_train.median(numeric_only=True)).fillna(0.0)
-        y_test = test["future_direction"].astype(int)
+        split_idx = int(round(len(train) * (1.0 - float(config.calibration_fraction))))
+        split_idx = max(1, min(split_idx, len(train) - 1))
 
-        if y_train.nunique() < 2 or y_test.nunique() < 2:
+        fit = train.iloc[:split_idx].copy()
+        calibration = train.iloc[split_idx:].copy()
+        if len(calibration) < 50:
+            fit = train.copy()
+            calibration = pd.DataFrame()
+
+        x_fit = fit.reindex(columns=feature_cols).copy()
+        x_fit = x_fit.fillna(x_fit.median(numeric_only=True)).fillna(0.0)
+        y_fit = fit["future_direction"].astype(int)
+
+        if y_fit.nunique() < 2:
             return None
 
         model = build_stacking_classifier(random_state=42)
-        model.fit(x_train, y_train)
+        model.fit(x_fit, y_fit)
 
-        pred = model.predict(x_test)
-        prob = model.predict_proba(x_test)[:, 1]
+        calibration_params: dict[str, float] | None = None
+        tuned_thresholds: dict[str, float | int] = {"long": 0.55, "short": 0.45, "objective": 0.0, "trades": 0}
+        if not calibration.empty:
+            x_cal = calibration.reindex(columns=feature_cols).copy()
+            x_cal = x_cal.fillna(x_fit.median(numeric_only=True)).fillna(0.0)
+            y_cal = calibration["future_direction"].astype(int)
+            if y_cal.nunique() >= 2:
+                prob_cal_raw = model.predict_proba(x_cal)[:, 1]
+                calibration_params = fit_probability_calibration(prob_cal_raw, y_cal)
+                prob_cal = apply_probability_calibration(prob_cal_raw, calibration_params)
+                tuned = optimize_thresholds_from_validation(
+                    prob_up=prob_cal,
+                    future_return=calibration["future_return"],
+                    min_trades=max(10, int(len(calibration) * 0.05)),
+                )
+                tuned_thresholds = tuned.to_dict()
+
+        x_test = test.reindex(columns=feature_cols).copy()
+        x_test = x_test.fillna(x_fit.median(numeric_only=True)).fillna(0.0)
+        y_test = test["future_direction"].astype(int)
+
+        if y_test.nunique() < 2:
+            return None
+
+        prob_raw = model.predict_proba(x_test)[:, 1]
+        prob = apply_probability_calibration(prob_raw, calibration_params)
+        pred = (prob >= 0.5).astype(int)
         metrics = evaluate_binary(y_test, pred, prob)
 
         artifact = PatternModelArtifact(
@@ -129,6 +176,10 @@ class PatternTrainer:
                 "dropped_correlated": int(selection.dropped_correlated),
                 "dropped_low_importance": int(selection.dropped_low_importance),
             },
+            train_end_datetime=train_end_datetime.isoformat() if pd.notna(train_end_datetime) else None,
+            test_start_datetime=test_start_datetime.isoformat() if pd.notna(test_start_datetime) else None,
+            probability_calibration=calibration_params or {},
+            tuned_thresholds=tuned_thresholds,
         )
         self.model_io.save(artifact)
 
@@ -151,7 +202,7 @@ class PatternTrainer:
             )
             top_features = ", ".join(importance["feature"].head(8).tolist())
 
-        cv_auc = timeseries_cv_score(x_train, y_train, n_splits=4)
+        cv_auc = timeseries_cv_score(x_fit, y_fit, n_splits=4)
 
         return {
             "pattern": pattern_name,
@@ -172,6 +223,8 @@ class PatternTrainer:
             "dropped_constant": int(selection.dropped_constant),
             "dropped_correlated": int(selection.dropped_correlated),
             "dropped_low_importance": int(selection.dropped_low_importance),
+            "tuned_long_threshold": float(tuned_thresholds.get("long", 0.55)),
+            "tuned_short_threshold": float(tuned_thresholds.get("short", 0.45)),
             "top_features": top_features,
             "importance_path": importance_path,
         }

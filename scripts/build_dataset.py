@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--refresh-prices", action="store_true", help="Force fresh market data pull")
     parser.add_argument("--dataset-name", default="model_dataset", help="Output dataset name")
     parser.add_argument("--politician-trades-csv", type=Path, default=None, help="Optional normalized politician trades CSV")
+    parser.add_argument("--universe", choices=["sp500", "sp100", "custom"], default=None, help="Universe override")
     args = parser.parse_args()
 
     service = StonkService(get_settings())
@@ -30,6 +31,7 @@ def main() -> None:
         refresh_prices=args.refresh_prices,
         dataset_name=args.dataset_name,
         politician_trades_csv=args.politician_trades_csv,
+        universe=args.universe,
         years_ago_start=args.years_ago_start,
         years_ago_end=args.years_ago_end,
     )

@@ -20,6 +20,10 @@ def main() -> None:
     parser.add_argument("--min-confidence", type=float, default=0.5, help="Minimum signal confidence")
     parser.add_argument("--no-refresh", action="store_true", help="Use cached prices only")
     parser.add_argument("--politician-trades-csv", type=Path, default=None, help="Optional politician trades CSV")
+    parser.add_argument("--use-model-thresholds", action="store_true", help="Use tuned thresholds from model metadata")
+    parser.add_argument("--long-threshold", type=float, default=None, help="Override long threshold")
+    parser.add_argument("--short-threshold", type=float, default=None, help="Override short threshold")
+    parser.add_argument("--universe", choices=["sp500", "sp100", "custom"], default=None, help="Universe override")
     parser.add_argument("--pattern", action="append", default=None, help="Optional pattern filter, repeatable")
     parser.add_argument("--model-file", action="append", default=None, help="Optional model file filter, repeatable")
     args = parser.parse_args()
@@ -34,6 +38,10 @@ def main() -> None:
         include_patterns=set(args.pattern or []) or None,
         include_model_files=set(args.model_file or []) or None,
         min_confidence=args.min_confidence,
+        use_model_thresholds=args.use_model_thresholds,
+        long_threshold=args.long_threshold,
+        short_threshold=args.short_threshold,
+        universe=args.universe,
     )
     if signals.empty:
         print("No signals. Ensure models are trained for this interval/horizon.")

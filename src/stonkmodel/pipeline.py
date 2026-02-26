@@ -6,11 +6,22 @@ from typing import Literal
 
 import pandas as pd
 
-from stonkmodel.backtest.walk_forward import run_pattern_backtests, summarize_pattern_coverage
+from stonkmodel.backtest.walk_forward import (
+    run_pattern_backtests,
+    run_walk_forward_retraining_backtests,
+    summarize_pattern_coverage,
+)
 from stonkmodel.config import Settings
 from stonkmodel.data.external_features import build_fundamental_table, engineer_politician_features, load_politician_trades
 from stonkmodel.data.market_data import DownloadSpec, MarketDataClient, ParquetMarketStore, filter_minimum_history
-from stonkmodel.data.universe import get_custom_symbols, get_sp100_symbols_resilient, get_sp500_symbols_resilient
+from stonkmodel.data.universe import (
+    build_static_membership_intervals,
+    filter_frames_by_membership_intervals,
+    get_custom_symbols,
+    get_sp100_symbols_resilient,
+    get_sp500_membership_intervals_resilient,
+    get_sp500_symbols_resilient,
+)
 from stonkmodel.features.dataset import DatasetBuilder, DatasetOptions
 from stonkmodel.models.stacking import PatternModelIO
 from stonkmodel.models.trainer import PatternTrainer, TrainConfig
@@ -77,7 +88,8 @@ class StonkService:
         years_ago_start: int | None = None,
         years_ago_end: int | None = None,
     ) -> dict[str, pd.DataFrame]:
-        symbols = self.resolve_universe(universe=universe)
+        resolved_universe = universe or self.settings.universe_source
+        symbols = self.resolve_universe(universe=resolved_universe)
         lookback_years = int(years) if years is not None else int(self.settings.history_years)
         if lookback_years < 1:
             lookback_years = 1
@@ -96,6 +108,11 @@ class StonkService:
             frames=frames,
             years_ago_start=years_ago_start,
             years_ago_end=years_ago_end,
+        )
+        frames = self._filter_frames_by_universe_membership(
+            frames=frames,
+            universe=resolved_universe,
+            symbols=symbols,
         )
         frames = filter_minimum_history(frames, min_rows=120)
         return frames
@@ -168,26 +185,59 @@ class StonkService:
         self,
         dataset_name: str = "model_dataset",
         interval: str | None = None,
-        long_threshold: float = 0.55,
-        short_threshold: float = 0.45,
+        mode: Literal["saved_models", "walk_forward_retrain"] = "saved_models",
+        long_threshold: float | None = 0.55,
+        short_threshold: float | None = 0.45,
         fee_bps: float = 1.0,
         include_patterns: set[str] | None = None,
         include_model_files: set[str] | None = None,
+        use_model_thresholds: bool = False,
+        spread_bps: float = 0.0,
+        slippage_bps: float = 0.0,
+        short_borrow_bps_per_day: float = 0.0,
+        latency_bars: int = 0,
+        train_window_days: int = 504,
+        test_window_days: int = 63,
+        step_days: int = 21,
+        min_pattern_rows: int | None = None,
     ) -> pd.DataFrame:
         dataset = self.dataset_builder.load_dataset(dataset_name)
         if dataset.empty:
             raise RuntimeError("Dataset is empty. Run build_dataset first.")
 
+        used_interval = interval or self.settings.default_interval
+        if mode == "walk_forward_retrain":
+            return run_walk_forward_retraining_backtests(
+                dataset=dataset,
+                interval=used_interval,
+                horizon_bars=self.settings.forward_horizon_bars,
+                train_window_days=int(train_window_days),
+                test_window_days=int(test_window_days),
+                step_days=int(step_days),
+                min_pattern_rows=int(min_pattern_rows or self.settings.min_pattern_count),
+                include_patterns=include_patterns,
+                fee_bps=float(fee_bps),
+                spread_bps=float(spread_bps),
+                slippage_bps=float(slippage_bps),
+                short_borrow_bps_per_day=float(short_borrow_bps_per_day),
+                latency_bars=int(latency_bars),
+            )
+
         return run_pattern_backtests(
-            dataset,
+            dataset=dataset,
             model_io=self.model_io,
-            interval=interval or self.settings.default_interval,
+            interval=used_interval,
             horizon_bars=self.settings.forward_horizon_bars,
             long_threshold=long_threshold,
             short_threshold=short_threshold,
             fee_bps=fee_bps,
             include_patterns=include_patterns,
             include_model_files=include_model_files,
+            use_model_thresholds=use_model_thresholds,
+            spread_bps=spread_bps,
+            slippage_bps=slippage_bps,
+            short_borrow_bps_per_day=short_borrow_bps_per_day,
+            latency_bars=latency_bars,
         )
 
     def scan(
@@ -201,6 +251,9 @@ class StonkService:
         include_model_files: set[str] | None = None,
         min_confidence: float = 0.5,
         universe: Literal["sp500", "sp100", "custom"] | None = None,
+        use_model_thresholds: bool = True,
+        long_threshold: float | None = None,
+        short_threshold: float | None = None,
     ) -> pd.DataFrame:
         used_interval = interval or self.settings.default_interval
         frames = self.load_history(interval=used_interval, years=years, refresh=refresh_prices, universe=universe)
@@ -230,6 +283,9 @@ class StonkService:
                 horizon_bars=self.settings.forward_horizon_bars,
                 top_n=top_n or self.settings.top_n_signals,
                 min_confidence=min_confidence,
+                use_model_thresholds=use_model_thresholds,
+                long_threshold=long_threshold,
+                short_threshold=short_threshold,
             ),
             fundamentals=fundamentals,
             politician_features=politician,
@@ -259,6 +315,9 @@ class StonkService:
     def dataset_summary(self, dataset_name: str) -> dict[str, object]:
         return self.dataset_builder.dataset_summary(dataset_name)
 
+    def delete_dataset(self, dataset_name: str) -> bool:
+        return self.dataset_builder.delete_dataset(dataset_name)
+
     def model_registry(self, interval: str | None = None, pattern: str | None = None) -> pd.DataFrame:
         return self.model_io.get_model_registry(interval=interval, pattern=pattern)
 
@@ -268,6 +327,9 @@ class StonkService:
         if isinstance(importance, pd.DataFrame):
             details["importance"] = importance.to_dict(orient="records")
         return details
+
+    def delete_model(self, model_file: str) -> dict[str, object]:
+        return self.model_io.delete_model(model_file)
 
     def sweep_intervals(
         self,
@@ -346,3 +408,30 @@ class StonkService:
                 continue
             out[symbol] = filtered
         return out
+
+    def _filter_frames_by_universe_membership(
+        self,
+        frames: dict[str, pd.DataFrame],
+        universe: Literal["sp500", "sp100", "custom"],
+        symbols: list[str],
+    ) -> dict[str, pd.DataFrame]:
+        if not frames:
+            return {}
+
+        try:
+            if universe == "sp500":
+                intervals = get_sp500_membership_intervals_resilient(
+                    cache_path=self.settings.processed_data_dir / "sp500_membership_intervals.csv",
+                    symbols=symbols,
+                )
+                return filter_frames_by_membership_intervals(frames, intervals)
+
+            if universe == "sp100":
+                intervals = build_static_membership_intervals(symbols=symbols)
+                return filter_frames_by_membership_intervals(frames, intervals)
+        except Exception:
+            # Universe membership filtering is best-effort. If upstream metadata is unavailable,
+            # continue with raw frames instead of hard-failing dataset builds.
+            return frames
+
+        return frames

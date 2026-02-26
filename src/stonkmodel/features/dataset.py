@@ -86,6 +86,14 @@ class DatasetBuilder:
             return pd.DataFrame()
         return pd.read_parquet(path)
 
+    def delete_dataset(self, name: str) -> bool:
+        safe_name = Path(name).stem
+        path = self.processed_dir / f"{safe_name}.parquet"
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+
     def list_datasets(self) -> pd.DataFrame:
         rows: list[dict[str, object]] = []
         for path in sorted(self.processed_dir.glob("*.parquet")):

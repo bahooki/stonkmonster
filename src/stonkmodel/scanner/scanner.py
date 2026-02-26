@@ -8,6 +8,7 @@ import pandas as pd
 from stonkmodel.data.external_features import merge_external_features
 from stonkmodel.features.indicators import add_indicators
 from stonkmodel.features.patterns import add_candlestick_patterns
+from stonkmodel.models.calibration import apply_probability_calibration, resolve_thresholds
 from stonkmodel.models.stacking import PatternModelIO
 
 
@@ -17,6 +18,9 @@ class ScanConfig:
     horizon_bars: int
     top_n: int = 50
     min_confidence: float = 0.5
+    use_model_thresholds: bool = True
+    long_threshold: float | None = None
+    short_threshold: float | None = None
 
 
 class SignalScanner:
@@ -62,6 +66,12 @@ class SignalScanner:
             model = payload["model"]
             feature_cols: list[str] = payload["feature_columns"]
             metrics = payload.get("metrics", {})
+            long_t, short_t = resolve_thresholds(
+                payload=payload,
+                long_threshold=config.long_threshold,
+                short_threshold=config.short_threshold,
+                use_model_thresholds=config.use_model_thresholds,
+            )
 
             if pattern == "none":
                 subset = latest.loc[latest["pattern"].isna()].copy()
@@ -75,13 +85,28 @@ class SignalScanner:
                 continue
 
             x = subset.reindex(columns=feature_cols).fillna(subset.median(numeric_only=True)).fillna(0.0)
-            prob_up = model.predict_proba(x)[:, 1]
+            prob_up_raw = model.predict_proba(x)[:, 1]
+            prob_up = apply_probability_calibration(prob_up_raw, payload.get("probability_calibration"))
             prob_down = 1.0 - prob_up
             subset["prob_up"] = prob_up
             subset["prob_down"] = prob_down
-            subset["signal"] = np.where(subset["prob_up"] >= 0.5, "up", "down")
-            subset["confidence"] = np.maximum(subset["prob_up"], subset["prob_down"])
-            subset["edge"] = (subset["prob_up"] - 0.5).abs()
+            subset["signal"] = "flat"
+            subset.loc[subset["prob_up"] >= long_t, "signal"] = "up"
+            subset.loc[subset["prob_up"] <= short_t, "signal"] = "down"
+            subset = subset.loc[subset["signal"] != "flat"].copy()
+            if subset.empty:
+                continue
+
+            subset["confidence"] = np.where(
+                subset["signal"] == "up",
+                subset["prob_up"],
+                subset["prob_down"],
+            )
+            subset["edge"] = np.where(
+                subset["signal"] == "up",
+                subset["prob_up"] - long_t,
+                short_t - subset["prob_up"],
+            )
 
             subset = subset.loc[subset["confidence"] >= float(config.min_confidence)].copy()
             if subset.empty:
@@ -100,6 +125,8 @@ class SignalScanner:
                         "confidence": float(row["confidence"]),
                         "edge": float(row["edge"]),
                         "model_roc_auc": float(metrics.get("roc_auc", np.nan)),
+                        "long_threshold": float(long_t),
+                        "short_threshold": float(short_t),
                     }
                 )
 
@@ -116,6 +143,8 @@ class SignalScanner:
                     "confidence",
                     "edge",
                     "model_roc_auc",
+                    "long_threshold",
+                    "short_threshold",
                 ]
             )
 

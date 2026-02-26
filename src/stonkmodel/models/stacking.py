@@ -161,6 +161,10 @@ class PatternModelArtifact:
     train_rows: int
     test_rows: int
     feature_selection: dict[str, Any] | None = None
+    train_end_datetime: str | None = None
+    test_start_datetime: str | None = None
+    probability_calibration: dict[str, Any] | None = None
+    tuned_thresholds: dict[str, Any] | None = None
 
 
 class PatternModelIO:
@@ -191,6 +195,10 @@ class PatternModelIO:
             "train_rows": artifact.train_rows,
             "test_rows": artifact.test_rows,
             "feature_selection": artifact.feature_selection or {},
+            "train_end_datetime": artifact.train_end_datetime,
+            "test_start_datetime": artifact.test_start_datetime,
+            "probability_calibration": artifact.probability_calibration or {},
+            "tuned_thresholds": artifact.tuned_thresholds or {},
             "model": artifact.model,
         }
         joblib.dump(payload, path)
@@ -204,6 +212,10 @@ class PatternModelIO:
             "test_rows": artifact.test_rows,
             "feature_count": len(artifact.feature_columns),
             "feature_selection": artifact.feature_selection or {},
+            "train_end_datetime": artifact.train_end_datetime,
+            "test_start_datetime": artifact.test_start_datetime,
+            "probability_calibration": artifact.probability_calibration or {},
+            "tuned_thresholds": artifact.tuned_thresholds or {},
         }
         self._meta_path(artifact.pattern, artifact.interval, artifact.horizon_bars).write_text(
             json.dumps(meta),
@@ -224,6 +236,33 @@ class PatternModelIO:
 
     def list_models(self) -> list[Path]:
         return sorted(self.models_dir.glob("*.joblib"))
+
+    def delete_model(self, model_file: str | Path) -> dict[str, object]:
+        safe_file = Path(model_file).name
+        model_path = self.models_dir / safe_file
+        if model_path.suffix != ".joblib":
+            return {"deleted": False, "removed_files": []}
+        if not model_path.exists():
+            return {"deleted": False, "removed_files": []}
+
+        removed_files: list[str] = []
+        model_path.unlink()
+        removed_files.append(str(model_path))
+
+        parsed = self.parse_model_filename(model_path)
+        pattern = parsed.get("pattern")
+        interval = parsed.get("interval")
+        horizon = parsed.get("horizon_bars")
+        if pattern and interval and horizon is not None:
+            for extra_path in (
+                self._meta_path(str(pattern), str(interval), int(horizon)),
+                self._importance_path(str(pattern), str(interval), int(horizon)),
+            ):
+                if extra_path.exists():
+                    extra_path.unlink()
+                    removed_files.append(str(extra_path))
+
+        return {"deleted": True, "removed_files": removed_files}
 
     def save_feature_importance(
         self,
@@ -342,6 +381,10 @@ class PatternModelIO:
                 "test_rows": np.nan,
                 "feature_count": np.nan,
                 "raw_feature_count": np.nan,
+                "train_end_datetime": None,
+                "test_start_datetime": None,
+                "tuned_long_threshold": np.nan,
+                "tuned_short_threshold": np.nan,
                 "importance_file": None,
             }
             meta_loaded = False
@@ -361,6 +404,11 @@ class PatternModelIO:
                         row["feature_count"] = payload_meta.get("feature_count", np.nan)
                         fs = payload_meta.get("feature_selection", {}) or {}
                         row["raw_feature_count"] = fs.get("raw_feature_count", np.nan)
+                        row["train_end_datetime"] = payload_meta.get("train_end_datetime")
+                        row["test_start_datetime"] = payload_meta.get("test_start_datetime")
+                        tuned = payload_meta.get("tuned_thresholds", {}) or {}
+                        row["tuned_long_threshold"] = tuned.get("long", np.nan)
+                        row["tuned_short_threshold"] = tuned.get("short", np.nan)
                         meta_loaded = True
                     except Exception:
                         meta_loaded = False
@@ -379,6 +427,11 @@ class PatternModelIO:
                     row["feature_count"] = len(payload.get("feature_columns", []))
                     fs = payload.get("feature_selection", {}) or {}
                     row["raw_feature_count"] = fs.get("raw_feature_count", np.nan)
+                    row["train_end_datetime"] = payload.get("train_end_datetime")
+                    row["test_start_datetime"] = payload.get("test_start_datetime")
+                    tuned = payload.get("tuned_thresholds", {}) or {}
+                    row["tuned_long_threshold"] = tuned.get("long", np.nan)
+                    row["tuned_short_threshold"] = tuned.get("short", np.nan)
                 except Exception:
                     pass
 
@@ -408,6 +461,10 @@ class PatternModelIO:
                     "test_rows",
                     "feature_count",
                     "raw_feature_count",
+                    "train_end_datetime",
+                    "test_start_datetime",
+                    "tuned_long_threshold",
+                    "tuned_short_threshold",
                     "importance_file",
                 ]
             )
@@ -441,6 +498,10 @@ class PatternModelIO:
             "feature_columns": payload.get("feature_columns", []),
             "feature_count": len(payload.get("feature_columns", [])),
             "feature_selection": payload.get("feature_selection", {}),
+            "train_end_datetime": payload.get("train_end_datetime"),
+            "test_start_datetime": payload.get("test_start_datetime"),
+            "probability_calibration": payload.get("probability_calibration", {}),
+            "tuned_thresholds": payload.get("tuned_thresholds", {}),
             "importance": importance,
         }
 
