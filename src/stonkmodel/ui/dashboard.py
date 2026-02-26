@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any, Callable
 
@@ -61,10 +62,35 @@ def _pattern_names(frame: pd.DataFrame) -> list[str]:
     return sorted(frame["pattern"].dropna().astype(str).unique().tolist())
 
 
-def _run_or_queue(name: str, run_async: bool, fn: Callable[[], Any]) -> tuple[str | None, Any | None]:
+def _accepts_progress_callback(fn: Callable[..., Any]) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except Exception:
+        return False
+    for param in sig.parameters.values():
+        if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            return True
+        if param.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+    return False
+
+
+def _run_or_queue(name: str, run_async: bool, fn: Callable[..., Any]) -> tuple[str | None, Any | None]:
     if run_async:
         job_id = job_manager.submit(name=name, fn=fn)
         return job_id, None
+    if _accepts_progress_callback(fn):
+        progress_slot = st.empty()
+        bar = progress_slot.progress(0.0, text="0.0% - Starting")
+
+        def _inline_progress(pct: float, message: str) -> None:
+            bar.progress(max(0.0, min(1.0, float(pct) / 100.0)), text=f"{float(pct):.1f}% - {message}")
+
+        try:
+            result = fn(_inline_progress)
+        finally:
+            progress_slot.empty()
+        return None, result
     return None, fn()
 
 
@@ -122,7 +148,7 @@ with tab_data:
     if submitted:
         politician_path = Path(politician_path_raw).expanduser() if politician_path_raw else None
 
-        def _task() -> dict[str, object]:
+        def _task(progress: Callable[[float, str], None] | None = None) -> dict[str, object]:
             result = service.build_dataset(
                 interval=interval,
                 years=years_ago_range[1],
@@ -132,6 +158,7 @@ with tab_data:
                 universe=selected_universe,
                 years_ago_start=years_ago_range[0],
                 years_ago_end=years_ago_range[1],
+                progress_callback=progress,
             )
             return {
                 "universe": result.universe,
@@ -195,7 +222,7 @@ with tab_train:
         st.info("Build a dataset first.")
     else:
         with st.form("train_form"):
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
             with col1:
                 train_dataset = st.selectbox("Dataset", options=choices, index=0)
             with col2:
@@ -207,15 +234,39 @@ with tab_train:
                     max_value=100000,
                     value=settings.min_pattern_count,
                 )
+            with col4:
+                train_model_name = st.text_input("Model name (optional)", value="")
+            with col5:
+                train_fast_mode = st.checkbox("Fast mode", value=True)
+            with col6:
+                train_parallel_patterns = st.number_input(
+                    "Parallel patterns",
+                    min_value=1,
+                    max_value=16,
+                    value=4,
+                    step=1,
+                )
+            train_max_rows_per_pattern = st.number_input(
+                "Max rows per pattern (0 = no cap)",
+                min_value=0,
+                max_value=2_000_000,
+                value=120000,
+                step=10000,
+            )
             submitted = st.form_submit_button("Train Models", use_container_width=True)
 
         if submitted:
 
-            def _task() -> pd.DataFrame:
+            def _task(progress: Callable[[float, str], None] | None = None) -> pd.DataFrame:
                 return service.train(
                     dataset_name=train_dataset,
                     interval=train_interval,
                     min_pattern_rows=int(min_pattern_rows),
+                    model_name=train_model_name or None,
+                    progress_callback=progress,
+                    parallel_patterns=int(train_parallel_patterns),
+                    fast_mode=bool(train_fast_mode),
+                    max_rows_per_pattern=None if int(train_max_rows_per_pattern) <= 0 else int(train_max_rows_per_pattern),
                 )
 
             job_id, table = _run_or_queue("train_models", run_async_jobs, _task)
@@ -284,9 +335,29 @@ with tab_backtest:
             with col11:
                 latency_bars = st.number_input("Latency bars", min_value=0, max_value=100, value=0, step=1)
 
+            st.write("Performance")
+            col_fast, col_workers = st.columns(2)
+            with col_fast:
+                bt_fast_mode = st.checkbox("Fast mode", value=True)
+            with col_workers:
+                bt_parallel_models = st.number_input(
+                    "Parallel model workers",
+                    min_value=1,
+                    max_value=32,
+                    value=4,
+                    step=1,
+                )
+            bt_max_eval_rows = st.number_input(
+                "Max eval rows per pattern (saved-model mode, 0 = no cap)",
+                min_value=0,
+                max_value=20_000_000,
+                value=250000,
+                step=10000,
+            )
+
             if bt_mode == "walk_forward_retrain":
                 st.write("Walk-forward settings")
-                col12, col13, col14, col15 = st.columns(4)
+                col12, col13, col14, col15, col16, col17 = st.columns(6)
                 with col12:
                     train_window_days = st.number_input("Train window days", min_value=30, max_value=3650, value=504, step=21)
                 with col13:
@@ -301,12 +372,30 @@ with tab_backtest:
                         value=settings.min_pattern_count,
                         step=10,
                     )
+                with col16:
+                    bt_max_windows = st.number_input(
+                        "Max windows/pattern (0 = no cap)",
+                        min_value=0,
+                        max_value=20000,
+                        value=80,
+                        step=10,
+                    )
+                with col17:
+                    bt_max_train_rows = st.number_input(
+                        "Max train rows/window (0 = no cap)",
+                        min_value=0,
+                        max_value=20_000_000,
+                        value=120000,
+                        step=10000,
+                    )
                 selected_model_files: list[str] = []
             else:
                 train_window_days = 504
                 test_window_days = 63
                 step_days = 21
                 min_pattern_rows_bt = settings.min_pattern_count
+                bt_max_windows = 0
+                bt_max_train_rows = 0
                 model_options = _model_files(models.loc[models["interval"] == bt_interval]) if not models.empty else []
                 selected_model_files = st.multiselect("Filter model files (optional)", options=model_options, default=[])
 
@@ -336,6 +425,11 @@ with tab_backtest:
                     test_window_days=int(test_window_days),
                     step_days=int(step_days),
                     min_pattern_rows=int(min_pattern_rows_bt),
+                    fast_mode=bool(bt_fast_mode),
+                    parallel_models=int(bt_parallel_models),
+                    max_eval_rows_per_pattern=None if int(bt_max_eval_rows) <= 0 else int(bt_max_eval_rows),
+                    max_windows_per_pattern=None if int(bt_max_windows) <= 0 else int(bt_max_windows),
+                    max_train_rows_per_window=None if int(bt_max_train_rows) <= 0 else int(bt_max_train_rows),
                 )
 
             job_id, bt = _run_or_queue("backtest", run_async_jobs, _task)
@@ -458,6 +552,7 @@ with tab_models:
                 "pattern": details.get("pattern"),
                 "interval": details.get("interval"),
                 "horizon_bars": details.get("horizon_bars"),
+                "model_name": details.get("model_name"),
                 "metrics": details.get("metrics"),
                 "train_rows": details.get("train_rows"),
                 "test_rows": details.get("test_rows"),
@@ -544,8 +639,26 @@ with tab_jobs:
     if jobs.empty:
         st.info("No jobs yet. Queue one from Data, Train, Backtest, Scanner, or Analytics tabs.")
     else:
+        jobs_display = jobs.copy()
+        if "progress_pct" not in jobs_display.columns:
+            jobs_display["progress_pct"] = 0.0
+        if "status_message" not in jobs_display.columns:
+            jobs_display["status_message"] = None
+        jobs_display["progress_pct"] = jobs_display["progress_pct"].fillna(0.0).astype(float).round(1)
         st.dataframe(
-            jobs[["job_id", "name", "status", "created_at", "started_at", "finished_at", "error"]],
+            jobs_display[
+                [
+                    "job_id",
+                    "name",
+                    "status",
+                    "progress_pct",
+                    "status_message",
+                    "created_at",
+                    "started_at",
+                    "finished_at",
+                    "error",
+                ]
+            ],
             use_container_width=True,
         )
 
@@ -556,11 +669,16 @@ with tab_jobs:
         )
         if selected_job_id:
             details = job_manager.get_job(selected_job_id) or {}
+            pct = float(details.get("progress_pct", 0.0) or 0.0)
+            msg = details.get("status_message") or "Working"
+            st.progress(max(0.0, min(1.0, pct / 100.0)), text=f"{pct:.1f}% - {msg}")
             st.json(
                 {
                     "job_id": details.get("job_id"),
                     "name": details.get("name"),
                     "status": details.get("status"),
+                    "progress_pct": details.get("progress_pct"),
+                    "status_message": details.get("status_message"),
                     "created_at": details.get("created_at"),
                     "started_at": details.get("started_at"),
                     "finished_at": details.get("finished_at"),
@@ -572,6 +690,13 @@ with tab_jobs:
 
             if details.get("traceback"):
                 st.code(str(details.get("traceback")), language="text")
+
+            progress_log = details.get("progress_log")
+            if isinstance(progress_log, list) and progress_log:
+                st.write("### Progress Log")
+                log_frame = pd.DataFrame(progress_log)
+                if not log_frame.empty:
+                    st.dataframe(log_frame.tail(40), use_container_width=True)
 
             result = job_manager.load_result(selected_job_id)
             if isinstance(result, pd.DataFrame):

@@ -17,6 +17,10 @@ def main() -> None:
     parser.add_argument("--dataset-name", default="model_dataset", help="Existing dataset name")
     parser.add_argument("--interval", default=None, help="Interval tied to model names")
     parser.add_argument("--min-pattern-rows", type=int, default=None, help="Override minimum pattern rows required")
+    parser.add_argument("--model-name", default=None, help="Optional model name tag (e.g. wf_2026_q1)")
+    parser.add_argument("--parallel-patterns", type=int, default=None, help="Pattern models to train in parallel")
+    parser.add_argument("--fast-mode", action="store_true", help="Faster training (skip CV and permutation importance)")
+    parser.add_argument("--max-rows-per-pattern", type=int, default=None, help="Cap rows per pattern for faster training")
     args = parser.parse_args()
 
     service = StonkService(get_settings())
@@ -24,6 +28,10 @@ def main() -> None:
         dataset_name=args.dataset_name,
         interval=args.interval,
         min_pattern_rows=args.min_pattern_rows,
+        model_name=args.model_name,
+        parallel_patterns=args.parallel_patterns,
+        fast_mode=args.fast_mode,
+        max_rows_per_pattern=args.max_rows_per_pattern,
     )
     if summary.empty:
         print("No pattern models trained. Increase history or lower min pattern count.")

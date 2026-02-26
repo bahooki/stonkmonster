@@ -29,6 +29,11 @@ def main() -> None:
     parser.add_argument("--test-window-days", type=int, default=63, help="Walk-forward test window")
     parser.add_argument("--step-days", type=int, default=21, help="Walk-forward step size")
     parser.add_argument("--min-pattern-rows", type=int, default=None, help="Minimum rows per pattern for walk-forward retraining")
+    parser.add_argument("--fast-mode", action="store_true", help="Faster backtest settings")
+    parser.add_argument("--parallel-models", type=int, default=1, help="Saved-model backtest parallel workers")
+    parser.add_argument("--max-eval-rows-per-pattern", type=int, default=None, help="Cap eval rows per pattern in saved-model mode")
+    parser.add_argument("--max-windows-per-pattern", type=int, default=None, help="Cap walk-forward windows per pattern")
+    parser.add_argument("--max-train-rows-per-window", type=int, default=None, help="Cap walk-forward train rows per window")
     parser.add_argument("--pattern", action="append", default=None, help="Optional pattern filter, repeatable")
     parser.add_argument("--model-file", action="append", default=None, help="Optional model file filter, repeatable")
     args = parser.parse_args()
@@ -50,6 +55,11 @@ def main() -> None:
         test_window_days=args.test_window_days,
         step_days=args.step_days,
         min_pattern_rows=args.min_pattern_rows,
+        fast_mode=args.fast_mode,
+        parallel_models=args.parallel_models,
+        max_eval_rows_per_pattern=args.max_eval_rows_per_pattern,
+        max_windows_per_pattern=args.max_windows_per_pattern,
+        max_train_rows_per_window=args.max_train_rows_per_window,
         include_patterns=set(args.pattern or []) or None,
         include_model_files=set(args.model_file or []) or None,
     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import numpy as np
@@ -72,6 +73,17 @@ def _extract_pattern_subset(frame: pd.DataFrame, pattern: str) -> pd.DataFrame:
     return frame.loc[frame[pattern_col] == 1].copy()
 
 
+def _cap_rows_for_speed(frame: pd.DataFrame, max_rows: int | None) -> pd.DataFrame:
+    if max_rows is None:
+        return frame
+    cap = int(max_rows)
+    if cap <= 0 or len(frame) <= cap:
+        return frame
+    if "datetime" not in frame.columns:
+        return frame.tail(cap).copy()
+    return frame.sort_values("datetime").tail(cap).copy()
+
+
 def _compute_realized_return(
     frame: pd.DataFrame,
     horizon_bars: int,
@@ -128,6 +140,8 @@ def run_pattern_backtests(
     slippage_bps: float = 0.0,
     short_borrow_bps_per_day: float = 0.0,
     latency_bars: int = 0,
+    parallel_models: int = 1,
+    max_eval_rows_per_pattern: int | None = None,
 ) -> pd.DataFrame:
     if dataset.empty:
         return pd.DataFrame()
@@ -146,24 +160,41 @@ def run_pattern_backtests(
         if not train_dt.empty:
             default_train_end = train_dt.max()
 
-    rows: list[dict[str, float | int | str]] = []
-
+    candidate_models: list[tuple] = []
     for model_path in model_io.list_models():
         model_file = model_path.name
         if include_model_files and model_file not in include_model_files:
             continue
 
+        parsed = model_io.parse_model_filename(model_file)
+        parsed_interval = parsed.get("interval")
+        parsed_horizon = parsed.get("horizon_bars")
+        parsed_pattern = parsed.get("pattern")
+        if parsed_interval is not None and str(parsed_interval) != str(interval):
+            continue
+        if parsed_horizon is not None and int(parsed_horizon) != int(horizon_bars):
+            continue
+        if include_patterns and parsed_pattern is not None and str(parsed_pattern) not in include_patterns:
+            continue
+        candidate_models.append((model_path, model_file))
+
+    if not candidate_models:
+        return pd.DataFrame(
+            columns=["pattern", "model_file", "trades", "win_rate", "avg_trade_return", "cumulative_return", "sharpe"]
+        )
+
+    def evaluate_model(model_path, model_file: str) -> dict[str, float | int | str] | None:
         try:
             payload = model_io.load_from_path(model_path)
         except Exception:
-            continue
+            return None
 
         if payload.get("interval") != interval or int(payload.get("horizon_bars", -1)) != int(horizon_bars):
-            continue
+            return None
 
         pattern = str(payload["pattern"])
         if include_patterns and pattern not in include_patterns:
-            continue
+            return None
 
         model_train_end = pd.to_datetime(payload.get("train_end_datetime"), utc=True, errors="coerce")
         if pd.isna(model_train_end):
@@ -177,14 +208,15 @@ def run_pattern_backtests(
         if eval_pool.empty:
             eval_pool = default_test.copy()
         if eval_pool.empty:
-            continue
+            return None
 
         model = payload["model"]
         feature_cols = payload["feature_columns"]
 
         subset = _extract_pattern_subset(eval_pool, pattern=pattern)
+        subset = _cap_rows_for_speed(subset, max_rows=max_eval_rows_per_pattern)
         if subset.empty:
-            continue
+            return None
 
         x = subset.reindex(columns=feature_cols).fillna(subset.median(numeric_only=True)).fillna(0.0)
         prob_raw = model.predict_proba(x)[:, 1]
@@ -202,12 +234,12 @@ def run_pattern_backtests(
         subset.loc[subset["pred_prob_up"] <= short_t, "position"] = -1
         subset = subset.loc[subset["position"] != 0].copy()
         if subset.empty:
-            continue
+            return None
 
         subset["realized_return"] = _compute_realized_return(subset, horizon_bars=horizon_bars, latency_bars=latency_bars)
         subset = subset.dropna(subset=["realized_return"]).copy()
         if subset.empty:
-            continue
+            return None
 
         subset["strategy_return"] = _apply_execution_realism(
             subset=subset,
@@ -229,7 +261,28 @@ def run_pattern_backtests(
             cumulative_return=float((1.0 + subset["strategy_return"]).prod() - 1.0),
             sharpe=_safe_sharpe(subset["strategy_return"]),
         )
-        rows.append(result.to_dict())
+        return result.to_dict()
+
+    rows: list[dict[str, float | int | str]] = []
+    worker_count = max(1, int(parallel_models))
+    if worker_count <= 1:
+        for model_path, model_file in candidate_models:
+            row = evaluate_model(model_path, model_file=model_file)
+            if row is not None:
+                rows.append(row)
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            futures = {
+                pool.submit(evaluate_model, model_path, model_file): model_file
+                for model_path, model_file in candidate_models
+            }
+            for future in as_completed(futures):
+                try:
+                    row = future.result()
+                except Exception:
+                    continue
+                if row is not None:
+                    rows.append(row)
 
     if not rows:
         return pd.DataFrame(
@@ -252,6 +305,9 @@ def run_walk_forward_retraining_backtests(
     slippage_bps: float = 0.0,
     short_borrow_bps_per_day: float = 0.0,
     latency_bars: int = 0,
+    fast_mode: bool = False,
+    max_windows_per_pattern: int | None = None,
+    max_train_rows_per_window: int | None = None,
 ) -> pd.DataFrame:
     if dataset.empty:
         return pd.DataFrame()
@@ -278,22 +334,28 @@ def run_walk_forward_retraining_backtests(
         if subset_pattern.empty:
             continue
 
-        trade_returns: list[float] = []
-        trades = 0
-        windows_used = 0
+        windows: list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]] = []
         cursor = test_start
         while cursor < max_dt:
             train_start = cursor - pd.Timedelta(days=int(train_window_days))
             test_end = cursor + pd.Timedelta(days=int(test_window_days))
+            windows.append((train_start, cursor, test_end))
+            cursor = cursor + pd.Timedelta(days=int(step_days))
+        if max_windows_per_pattern is not None and int(max_windows_per_pattern) > 0 and len(windows) > int(max_windows_per_pattern):
+            windows = windows[-int(max_windows_per_pattern) :]
 
+        trade_returns: list[float] = []
+        trades = 0
+        windows_used = 0
+        for train_start, window_start, test_end in windows:
             train_win = subset_pattern.loc[
-                (subset_pattern["datetime"] >= train_start) & (subset_pattern["datetime"] < cursor)
+                (subset_pattern["datetime"] >= train_start) & (subset_pattern["datetime"] < window_start)
             ].copy()
             test_win = subset_pattern.loc[
-                (subset_pattern["datetime"] >= cursor) & (subset_pattern["datetime"] < test_end)
+                (subset_pattern["datetime"] >= window_start) & (subset_pattern["datetime"] < test_end)
             ].copy()
 
-            cursor = cursor + pd.Timedelta(days=int(step_days))
+            train_win = _cap_rows_for_speed(train_win, max_rows=max_train_rows_per_window)
             if len(train_win) < int(min_pattern_rows) or test_win.empty:
                 continue
 
@@ -302,7 +364,11 @@ def run_walk_forward_retraining_backtests(
             selection = select_features(
                 x_train=x_train_raw,
                 y_train=y_train,
-                config=FeatureSelectionConfig(random_state=42),
+                config=FeatureSelectionConfig(
+                    min_features=15 if fast_mode else 25,
+                    max_features=120 if fast_mode else 260,
+                    random_state=42,
+                ),
             )
             feature_cols = selection.selected_features
             if not feature_cols:
@@ -318,13 +384,13 @@ def run_walk_forward_retraining_backtests(
             if y_fit.nunique() < 2:
                 continue
 
-            model = build_stacking_classifier(random_state=42)
+            model = build_stacking_classifier(random_state=42, n_jobs=1, fast_mode=fast_mode)
             model.fit(x_fit, y_fit)
 
             calibration = None
             tuned_long = 0.55
             tuned_short = 0.45
-            if not cal_win.empty:
+            if not cal_win.empty and not fast_mode:
                 x_cal = cal_win.reindex(columns=feature_cols).fillna(x_fit.median(numeric_only=True)).fillna(0.0)
                 y_cal = cal_win["future_direction"].astype(int)
                 if y_cal.nunique() >= 2:

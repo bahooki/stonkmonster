@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 import joblib
@@ -17,7 +18,20 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 
 
-def _maybe_lightgbm(random_state: int):
+def _sanitize_model_name(model_name: str | None) -> str | None:
+    if model_name is None:
+        return None
+    text = str(model_name).strip()
+    if not text:
+        return None
+    text = text.lower()
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"[^a-z0-9_-]+", "", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text or None
+
+
+def _maybe_lightgbm(random_state: int, n_jobs: int):
     try:
         from lightgbm import LGBMClassifier
 
@@ -30,13 +44,14 @@ def _maybe_lightgbm(random_state: int):
                 subsample=0.8,
                 colsample_bytree=0.8,
                 random_state=random_state,
+                n_jobs=n_jobs,
             ),
         )
     except Exception:
         return None
 
 
-def _maybe_xgboost(random_state: int):
+def _maybe_xgboost(random_state: int, n_jobs: int):
     try:
         from xgboost import XGBClassifier
 
@@ -50,14 +65,14 @@ def _maybe_xgboost(random_state: int):
                 colsample_bytree=0.8,
                 eval_metric="logloss",
                 random_state=random_state,
-                n_jobs=1,
+                n_jobs=n_jobs,
             ),
         )
     except Exception:
         return None
 
 
-def _maybe_catboost(random_state: int):
+def _maybe_catboost(random_state: int, n_jobs: int):
     try:
         from catboost import CatBoostClassifier
 
@@ -69,6 +84,7 @@ def _maybe_catboost(random_state: int):
                 iterations=400,
                 loss_function="Logloss",
                 random_seed=random_state,
+                thread_count=n_jobs,
                 verbose=False,
             ),
         )
@@ -76,51 +92,79 @@ def _maybe_catboost(random_state: int):
         return None
 
 
-def build_stacking_classifier(random_state: int = 42) -> Pipeline:
-    base_estimators: list[tuple[str, Any]] = [
-        (
-            "hgb",
-            HistGradientBoostingClassifier(
-                learning_rate=0.05,
-                max_iter=300,
-                max_depth=8,
-                min_samples_leaf=50,
-                random_state=random_state,
-            ),
-        ),
-        (
-            "rf",
-            RandomForestClassifier(
-                n_estimators=400,
-                max_depth=10,
-                min_samples_leaf=20,
-                random_state=random_state,
-                n_jobs=-1,
-            ),
-        ),
-        (
-            "et",
-            ExtraTreesClassifier(
-                n_estimators=300,
-                max_depth=12,
-                min_samples_leaf=15,
-                random_state=random_state,
-                n_jobs=-1,
-            ),
-        ),
-    ]
+def build_stacking_classifier(random_state: int = 42, n_jobs: int = -1, fast_mode: bool = False) -> Pipeline:
+    model_n_jobs = int(n_jobs)
+    if model_n_jobs == 0:
+        model_n_jobs = 1
 
-    for optional_builder in (_maybe_lightgbm, _maybe_xgboost, _maybe_catboost):
-        built = optional_builder(random_state)
-        if built is not None:
-            base_estimators.append(built)
+    if fast_mode:
+        base_estimators: list[tuple[str, Any]] = [
+            (
+                "hgb",
+                HistGradientBoostingClassifier(
+                    learning_rate=0.06,
+                    max_iter=180,
+                    max_depth=6,
+                    min_samples_leaf=80,
+                    random_state=random_state,
+                ),
+            ),
+            (
+                "rf",
+                RandomForestClassifier(
+                    n_estimators=180,
+                    max_depth=8,
+                    min_samples_leaf=30,
+                    random_state=random_state,
+                    n_jobs=model_n_jobs,
+                ),
+            ),
+        ]
+    else:
+        base_estimators = [
+            (
+                "hgb",
+                HistGradientBoostingClassifier(
+                    learning_rate=0.05,
+                    max_iter=300,
+                    max_depth=8,
+                    min_samples_leaf=50,
+                    random_state=random_state,
+                ),
+            ),
+            (
+                "rf",
+                RandomForestClassifier(
+                    n_estimators=400,
+                    max_depth=10,
+                    min_samples_leaf=20,
+                    random_state=random_state,
+                    n_jobs=model_n_jobs,
+                ),
+            ),
+            (
+                "et",
+                ExtraTreesClassifier(
+                    n_estimators=300,
+                    max_depth=12,
+                    min_samples_leaf=15,
+                    random_state=random_state,
+                    n_jobs=model_n_jobs,
+                ),
+            ),
+        ]
+
+        for optional_builder in (_maybe_lightgbm, _maybe_xgboost, _maybe_catboost):
+            built = optional_builder(random_state, model_n_jobs)
+            if built is not None:
+                base_estimators.append(built)
 
     stack = StackingClassifier(
         estimators=base_estimators,
         final_estimator=LogisticRegression(max_iter=500),
-        passthrough=True,
-        n_jobs=-1,
-        cv=3,
+        passthrough=not fast_mode,
+        n_jobs=model_n_jobs,
+        cv=2 if fast_mode else 3,
     )
 
     pipeline = Pipeline(
@@ -155,6 +199,7 @@ class PatternModelArtifact:
     pattern: str
     interval: str
     horizon_bars: int
+    model_name: str | None
     feature_columns: list[str]
     model: Pipeline
     metrics: ModelMetrics
@@ -172,24 +217,35 @@ class PatternModelIO:
         self.models_dir = models_dir
         self.models_dir.mkdir(parents=True, exist_ok=True)
 
-    def _path(self, pattern: str, interval: str, horizon_bars: int) -> Path:
-        safe = f"{pattern}__{interval}__h{horizon_bars}.joblib".replace("/", "_")
+    def _stem(self, pattern: str, interval: str, horizon_bars: int, model_name: str | None = None) -> str:
+        safe_pattern = str(pattern).replace("/", "_")
+        safe_interval = str(interval).replace("/", "_")
+        safe = f"{safe_pattern}__{safe_interval}__h{horizon_bars}"
+        named = _sanitize_model_name(model_name)
+        if named:
+            safe = f"{safe}__n{named}"
+        return safe
+
+    def _path(self, pattern: str, interval: str, horizon_bars: int, model_name: str | None = None) -> Path:
+        safe = f"{self._stem(pattern, interval, horizon_bars, model_name=model_name)}.joblib"
         return self.models_dir / safe
 
-    def _importance_path(self, pattern: str, interval: str, horizon_bars: int) -> Path:
-        safe = f"{pattern}__{interval}__h{horizon_bars}.importance.parquet".replace("/", "_")
+    def _importance_path(self, pattern: str, interval: str, horizon_bars: int, model_name: str | None = None) -> Path:
+        safe = f"{self._stem(pattern, interval, horizon_bars, model_name=model_name)}.importance.parquet"
         return self.models_dir / safe
 
-    def _meta_path(self, pattern: str, interval: str, horizon_bars: int) -> Path:
-        safe = f"{pattern}__{interval}__h{horizon_bars}.meta.json".replace("/", "_")
+    def _meta_path(self, pattern: str, interval: str, horizon_bars: int, model_name: str | None = None) -> Path:
+        safe = f"{self._stem(pattern, interval, horizon_bars, model_name=model_name)}.meta.json"
         return self.models_dir / safe
 
     def save(self, artifact: PatternModelArtifact) -> Path:
-        path = self._path(artifact.pattern, artifact.interval, artifact.horizon_bars)
+        named = _sanitize_model_name(artifact.model_name)
+        path = self._path(artifact.pattern, artifact.interval, artifact.horizon_bars, model_name=named)
         payload = {
             "pattern": artifact.pattern,
             "interval": artifact.interval,
             "horizon_bars": artifact.horizon_bars,
+            "model_name": named,
             "feature_columns": artifact.feature_columns,
             "metrics": artifact.metrics.to_dict(),
             "train_rows": artifact.train_rows,
@@ -207,6 +263,7 @@ class PatternModelIO:
             "pattern": artifact.pattern,
             "interval": artifact.interval,
             "horizon_bars": artifact.horizon_bars,
+            "model_name": named,
             "metrics": artifact.metrics.to_dict(),
             "train_rows": artifact.train_rows,
             "test_rows": artifact.test_rows,
@@ -217,14 +274,14 @@ class PatternModelIO:
             "probability_calibration": artifact.probability_calibration or {},
             "tuned_thresholds": artifact.tuned_thresholds or {},
         }
-        self._meta_path(artifact.pattern, artifact.interval, artifact.horizon_bars).write_text(
+        self._meta_path(artifact.pattern, artifact.interval, artifact.horizon_bars, model_name=named).write_text(
             json.dumps(meta),
             encoding="utf-8",
         )
         return path
 
-    def load(self, pattern: str, interval: str, horizon_bars: int) -> dict[str, Any]:
-        path = self._path(pattern, interval, horizon_bars)
+    def load(self, pattern: str, interval: str, horizon_bars: int, model_name: str | None = None) -> dict[str, Any]:
+        path = self._path(pattern, interval, horizon_bars, model_name=model_name)
         if not path.exists():
             raise FileNotFoundError(f"Model file not found for pattern={pattern} interval={interval} horizon={horizon_bars}")
         return joblib.load(path)
@@ -253,10 +310,16 @@ class PatternModelIO:
         pattern = parsed.get("pattern")
         interval = parsed.get("interval")
         horizon = parsed.get("horizon_bars")
+        model_name = parsed.get("model_name")
         if pattern and interval and horizon is not None:
             for extra_path in (
-                self._meta_path(str(pattern), str(interval), int(horizon)),
-                self._importance_path(str(pattern), str(interval), int(horizon)),
+                self._meta_path(str(pattern), str(interval), int(horizon), model_name=str(model_name) if model_name else None),
+                self._importance_path(
+                    str(pattern),
+                    str(interval),
+                    int(horizon),
+                    model_name=str(model_name) if model_name else None,
+                ),
             ):
                 if extra_path.exists():
                     extra_path.unlink()
@@ -270,17 +333,26 @@ class PatternModelIO:
         interval: str,
         horizon_bars: int,
         frame: pd.DataFrame,
+        model_name: str | None = None,
     ) -> Path:
-        path = self._importance_path(pattern, interval, horizon_bars)
+        named = _sanitize_model_name(model_name)
+        path = self._importance_path(pattern, interval, horizon_bars, model_name=named)
         out = frame.copy()
         out["pattern"] = pattern
         out["interval"] = interval
         out["horizon_bars"] = int(horizon_bars)
+        out["model_name"] = named
         out.to_parquet(path, index=False)
         return path
 
-    def load_feature_importance(self, pattern: str, interval: str, horizon_bars: int) -> pd.DataFrame:
-        path = self._importance_path(pattern, interval, horizon_bars)
+    def load_feature_importance(
+        self,
+        pattern: str,
+        interval: str,
+        horizon_bars: int,
+        model_name: str | None = None,
+    ) -> pd.DataFrame:
+        path = self._importance_path(pattern, interval, horizon_bars, model_name=model_name)
         if not path.exists():
             return pd.DataFrame()
         return pd.read_parquet(path)
@@ -292,7 +364,7 @@ class PatternModelIO:
         stem = Path(model_file).stem
         parts = stem.split("__")
         if len(parts) < 3:
-            return {"pattern": stem, "interval": None, "horizon_bars": None}
+            return {"pattern": stem, "interval": None, "horizon_bars": None, "model_name": None}
         pattern, interval, h_token = parts[0], parts[1], parts[2]
         horizon = None
         if h_token.startswith("h"):
@@ -300,10 +372,17 @@ class PatternModelIO:
                 horizon = int(h_token[1:])
             except Exception:
                 horizon = None
+        model_name = None
+        if len(parts) >= 4:
+            for token in parts[3:]:
+                if token.startswith("n") and len(token) > 1:
+                    model_name = _sanitize_model_name(token[1:])
+                    break
         return {
             "pattern": pattern,
             "interval": interval,
             "horizon_bars": horizon,
+            "model_name": model_name,
         }
 
     def get_feature_importance_summary(
@@ -319,6 +398,7 @@ class PatternModelIO:
                     "pattern",
                     "interval",
                     "horizon_bars",
+                    "model_name",
                     "feature",
                     "importance_mean",
                     "importance_std",
@@ -347,12 +427,14 @@ class PatternModelIO:
             return pd.DataFrame()
 
         merged = pd.concat(frames, ignore_index=True)
+        if "model_name" not in merged.columns:
+            merged["model_name"] = None
         if "rank" not in merged.columns:
             merged = merged.sort_values("importance_abs", ascending=False).reset_index(drop=True)
-            merged["rank"] = merged.groupby(["pattern", "interval", "horizon_bars"]).cumcount() + 1
+            merged["rank"] = merged.groupby(["pattern", "interval", "horizon_bars", "model_name"]).cumcount() + 1
 
         merged = merged.loc[merged["rank"] <= int(top_n_per_pattern)]
-        return merged.sort_values(["pattern", "rank"]).reset_index(drop=True)
+        return merged.sort_values(["pattern", "model_name", "rank"]).reset_index(drop=True)
 
     def get_model_registry(self, interval: str | None = None, pattern: str | None = None) -> pd.DataFrame:
         rows: list[dict[str, Any]] = []
@@ -370,6 +452,7 @@ class PatternModelIO:
                 "pattern": meta.get("pattern"),
                 "interval": meta.get("interval"),
                 "horizon_bars": meta.get("horizon_bars"),
+                "model_name": meta.get("model_name"),
                 "size_kb": round(stat.st_size / 1024, 2),
                 "modified_utc": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
                 "accuracy": np.nan,
@@ -389,10 +472,16 @@ class PatternModelIO:
             }
             meta_loaded = False
             if meta.get("interval") is not None and meta.get("horizon_bars") is not None:
-                meta_path = self._meta_path(str(meta.get("pattern")), str(meta.get("interval")), int(meta.get("horizon_bars")))
+                meta_path = self._meta_path(
+                    str(meta.get("pattern")),
+                    str(meta.get("interval")),
+                    int(meta.get("horizon_bars")),
+                    model_name=str(meta.get("model_name")) if meta.get("model_name") else None,
+                )
                 if meta_path.exists():
                     try:
                         payload_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                        row["model_name"] = payload_meta.get("model_name", row.get("model_name"))
                         metrics = payload_meta.get("metrics", {})
                         row["accuracy"] = metrics.get("accuracy", np.nan)
                         row["precision"] = metrics.get("precision", np.nan)
@@ -416,6 +505,7 @@ class PatternModelIO:
             if not meta_loaded:
                 try:
                     payload = self.load_from_path(path)
+                    row["model_name"] = payload.get("model_name", row.get("model_name"))
                     metrics = payload.get("metrics", {})
                     row["accuracy"] = metrics.get("accuracy", np.nan)
                     row["precision"] = metrics.get("precision", np.nan)
@@ -436,7 +526,12 @@ class PatternModelIO:
                     pass
 
             if meta.get("interval") is not None and meta.get("horizon_bars") is not None:
-                imp_path = self._importance_path(str(meta.get("pattern")), str(meta.get("interval")), int(meta.get("horizon_bars")))
+                imp_path = self._importance_path(
+                    str(meta.get("pattern")),
+                    str(meta.get("interval")),
+                    int(meta.get("horizon_bars")),
+                    model_name=str(meta.get("model_name")) if meta.get("model_name") else None,
+                )
                 if imp_path.exists():
                     row["importance_file"] = imp_path.name
 
@@ -450,6 +545,7 @@ class PatternModelIO:
                     "pattern",
                     "interval",
                     "horizon_bars",
+                    "model_name",
                     "size_kb",
                     "modified_utc",
                     "accuracy",
@@ -481,8 +577,9 @@ class PatternModelIO:
         pattern = parsed.get("pattern")
         interval = parsed.get("interval")
         horizon = parsed.get("horizon_bars")
+        model_name = payload.get("model_name", parsed.get("model_name"))
         if pattern and interval and horizon is not None:
-            importance = self.load_feature_importance(pattern, interval, int(horizon))
+            importance = self.load_feature_importance(pattern, interval, int(horizon), model_name=model_name)
             if not importance.empty:
                 importance = importance.sort_values("rank").head(top_n_importance)
 
@@ -492,6 +589,7 @@ class PatternModelIO:
             "pattern": payload.get("pattern", pattern),
             "interval": payload.get("interval", interval),
             "horizon_bars": payload.get("horizon_bars", horizon),
+            "model_name": model_name,
             "metrics": payload.get("metrics", {}),
             "train_rows": payload.get("train_rows"),
             "test_rows": payload.get("test_rows"),
@@ -516,7 +614,7 @@ def evaluate_binary(y_true: pd.Series, y_pred: np.ndarray, y_prob: np.ndarray) -
     )
 
 
-def timeseries_cv_score(x: pd.DataFrame, y: pd.Series, n_splits: int = 5) -> float:
+def timeseries_cv_score(x: pd.DataFrame, y: pd.Series, n_splits: int = 5, model_n_jobs: int = -1) -> float:
     if len(x) < 500:
         return float("nan")
 
@@ -525,7 +623,7 @@ def timeseries_cv_score(x: pd.DataFrame, y: pd.Series, n_splits: int = 5) -> flo
     for train_idx, test_idx in splitter.split(x):
         x_train, x_test = x.iloc[train_idx], x.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-        model = build_stacking_classifier(random_state=42)
+        model = build_stacking_classifier(random_state=42, n_jobs=model_n_jobs)
         model.fit(x_train, y_train)
         prob = model.predict_proba(x_test)[:, 1]
         if len(np.unique(y_test)) < 2:

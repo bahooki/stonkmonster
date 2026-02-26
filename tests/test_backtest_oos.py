@@ -20,6 +20,7 @@ def test_backtest_uses_only_post_train_days(tmp_path: Path) -> None:
         pattern="doji",
         interval="1d",
         horizon_bars=1,
+        model_name=None,
         feature_columns=["feat"],
         model=model,
         metrics=ModelMetrics(accuracy=0.5, precision=0.5, recall=0.5, f1=0.5, roc_auc=0.5),

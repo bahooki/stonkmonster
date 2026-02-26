@@ -109,6 +109,10 @@ def train(payload: TrainRequest) -> dict[str, object]:
             dataset_name=payload.dataset_name,
             interval=payload.interval,
             min_pattern_rows=payload.min_pattern_rows,
+            model_name=payload.model_name,
+            parallel_patterns=payload.parallel_patterns,
+            fast_mode=payload.fast_mode,
+            max_rows_per_pattern=payload.max_rows_per_pattern,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -138,6 +142,11 @@ def backtest(payload: BacktestRequest) -> dict[str, object]:
             test_window_days=payload.test_window_days,
             step_days=payload.step_days,
             min_pattern_rows=payload.min_pattern_rows,
+            fast_mode=payload.fast_mode,
+            parallel_models=payload.parallel_models,
+            max_eval_rows_per_pattern=payload.max_eval_rows_per_pattern,
+            max_windows_per_pattern=payload.max_windows_per_pattern,
+            max_train_rows_per_window=payload.max_train_rows_per_window,
             include_patterns=set(payload.include_patterns or []) or None,
             include_model_files=set(payload.include_model_files or []) or None,
         )

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 import pandas as pd
 
@@ -26,6 +27,15 @@ from stonkmodel.features.dataset import DatasetBuilder, DatasetOptions
 from stonkmodel.models.stacking import PatternModelIO
 from stonkmodel.models.trainer import PatternTrainer, TrainConfig
 from stonkmodel.scanner.scanner import ScanConfig, SignalScanner
+
+
+ProgressCallback = Callable[[float, str], None]
+
+
+def _emit_progress(callback: ProgressCallback | None, pct: float, message: str) -> None:
+    if callback is None:
+        return
+    callback(max(0.0, min(100.0, float(pct))), str(message))
 
 
 @dataclass
@@ -87,9 +97,12 @@ class StonkService:
         universe: Literal["sp500", "sp100", "custom"] | None = None,
         years_ago_start: int | None = None,
         years_ago_end: int | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> dict[str, pd.DataFrame]:
+        _emit_progress(progress_callback, 3.0, "Resolving universe")
         resolved_universe = universe or self.settings.universe_source
         symbols = self.resolve_universe(universe=resolved_universe)
+        _emit_progress(progress_callback, 8.0, f"Universe resolved ({len(symbols)} symbols)")
         lookback_years = int(years) if years is not None else int(self.settings.history_years)
         if lookback_years < 1:
             lookback_years = 1
@@ -101,20 +114,33 @@ class StonkService:
             years=lookback_years,
         )
         if refresh:
-            frames = self.market.fetch(spec, refresh=True)
+            _emit_progress(progress_callback, 10.0, "Downloading market history")
+            frames = self.market.fetch(
+                spec,
+                refresh=True,
+                progress_callback=lambda p, msg: _emit_progress(progress_callback, 10.0 + (0.55 * p), msg),
+            )
         else:
-            frames = self.market.load_or_fetch(spec)
+            _emit_progress(progress_callback, 10.0, "Loading cached history and fetching gaps")
+            frames = self.market.load_or_fetch(
+                spec,
+                progress_callback=lambda p, msg: _emit_progress(progress_callback, 10.0 + (0.55 * p), msg),
+            )
+        _emit_progress(progress_callback, 68.0, f"Loaded history for {len(frames)} symbols")
         frames = self._filter_frames_by_years_ago_window(
             frames=frames,
             years_ago_start=years_ago_start,
             years_ago_end=years_ago_end,
         )
+        _emit_progress(progress_callback, 78.0, "Applied date window filter")
         frames = self._filter_frames_by_universe_membership(
             frames=frames,
             universe=resolved_universe,
             symbols=symbols,
         )
+        _emit_progress(progress_callback, 90.0, "Applied universe membership filter")
         frames = filter_minimum_history(frames, min_rows=120)
+        _emit_progress(progress_callback, 100.0, f"History ready ({len(frames)} symbols)")
         return frames
 
     def build_dataset(
@@ -127,7 +153,9 @@ class StonkService:
         universe: Literal["sp500", "sp100", "custom"] | None = None,
         years_ago_start: int | None = None,
         years_ago_end: int | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> BuildResult:
+        _emit_progress(progress_callback, 1.0, "Starting dataset build")
         resolved_universe = universe or self.settings.universe_source
         frames = self.load_history(
             interval=interval,
@@ -136,7 +164,9 @@ class StonkService:
             universe=resolved_universe,
             years_ago_start=years_ago_start,
             years_ago_end=years_ago_end,
+            progress_callback=lambda p, msg: _emit_progress(progress_callback, 5.0 + (0.65 * p), msg),
         )
+        _emit_progress(progress_callback, 72.0, "History loaded; building features and labels")
         symbols_requested = len(self.resolve_universe(universe=resolved_universe))
 
         options = DatasetOptions(
@@ -152,7 +182,9 @@ class StonkService:
             request_workers=self.settings.request_workers,
         )
         dataset = self.dataset_builder.build(frames, options)
+        _emit_progress(progress_callback, 95.0, "Saving dataset artifact")
         path = self.dataset_builder.save_dataset(dataset, name=dataset_name)
+        _emit_progress(progress_callback, 100.0, f"Dataset build completed ({len(dataset)} rows)")
 
         return BuildResult(
             universe=resolved_universe,
@@ -169,17 +201,57 @@ class StonkService:
         dataset_name: str = "model_dataset",
         interval: str | None = None,
         min_pattern_rows: int | None = None,
+        model_name: str | None = None,
+        progress_callback: ProgressCallback | None = None,
+        parallel_patterns: int | None = None,
+        fast_mode: bool = False,
+        max_rows_per_pattern: int | None = None,
     ) -> pd.DataFrame:
+        _emit_progress(progress_callback, 1.0, "Loading dataset")
         dataset = self.dataset_builder.load_dataset(dataset_name)
         if dataset.empty:
             raise RuntimeError("Dataset is empty. Run build_dataset first.")
+        _emit_progress(progress_callback, 5.0, "Training pattern models")
+
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        if parallel_patterns is None:
+            auto_parallel = min(4, cpu_count)
+            parallel_patterns = auto_parallel if fast_mode else 1
+        parallel_patterns = max(1, int(parallel_patterns))
+        model_n_jobs = 1 if parallel_patterns > 1 else -1
+        if max_rows_per_pattern is None and fast_mode:
+            max_rows_per_pattern = 120000
+        _emit_progress(
+            progress_callback,
+            6.0,
+            (
+                "Training config: "
+                f"parallel_patterns={parallel_patterns}, "
+                f"model_n_jobs={model_n_jobs}, "
+                f"fast_mode={fast_mode}, "
+                f"max_rows_per_pattern={max_rows_per_pattern}"
+            ),
+        )
 
         config = TrainConfig(
             interval=interval or self.settings.default_interval,
             horizon_bars=self.settings.forward_horizon_bars,
             min_pattern_rows=min_pattern_rows or self.settings.min_pattern_count,
+            model_name=model_name,
+            parallel_patterns=parallel_patterns,
+            model_n_jobs=model_n_jobs,
+            fast_mode=fast_mode,
+            max_rows_per_pattern=max_rows_per_pattern,
+            enable_permutation_importance=not fast_mode,
+            enable_timeseries_cv=not fast_mode,
         )
-        return self.trainer.train_all(dataset, config)
+        table = self.trainer.train_all(
+            dataset,
+            config,
+            progress_callback=lambda p, msg: _emit_progress(progress_callback, 5.0 + (0.95 * p), msg),
+        )
+        _emit_progress(progress_callback, 100.0, f"Training complete ({len(table)} models)")
+        return table
 
     def backtest(
         self,
@@ -200,6 +272,11 @@ class StonkService:
         test_window_days: int = 63,
         step_days: int = 21,
         min_pattern_rows: int | None = None,
+        fast_mode: bool = False,
+        parallel_models: int = 1,
+        max_eval_rows_per_pattern: int | None = None,
+        max_windows_per_pattern: int | None = None,
+        max_train_rows_per_window: int | None = None,
     ) -> pd.DataFrame:
         dataset = self.dataset_builder.load_dataset(dataset_name)
         if dataset.empty:
@@ -221,6 +298,9 @@ class StonkService:
                 slippage_bps=float(slippage_bps),
                 short_borrow_bps_per_day=float(short_borrow_bps_per_day),
                 latency_bars=int(latency_bars),
+                fast_mode=bool(fast_mode),
+                max_windows_per_pattern=max_windows_per_pattern,
+                max_train_rows_per_window=max_train_rows_per_window,
             )
 
         return run_pattern_backtests(
@@ -238,6 +318,8 @@ class StonkService:
             slippage_bps=slippage_bps,
             short_borrow_bps_per_day=short_borrow_bps_per_day,
             latency_bars=latency_bars,
+            parallel_models=int(parallel_models),
+            max_eval_rows_per_pattern=max_eval_rows_per_pattern,
         )
 
     def scan(

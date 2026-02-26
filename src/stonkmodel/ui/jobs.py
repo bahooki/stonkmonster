@@ -3,9 +3,11 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
+import inspect
 import json
 from pathlib import Path
 from threading import Lock
+import time
 import traceback
 from typing import Any, Callable
 from uuid import uuid4
@@ -31,6 +33,55 @@ def _to_json_safe(value: Any) -> Any:
     if is_dataclass(value):
         return _to_json_safe(asdict(value))
     return str(value)
+
+
+def _function_accepts_progress_arg(fn: Callable[..., Any]) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except Exception:
+        return False
+
+    positional_like = 0
+    for param in sig.parameters.values():
+        if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            positional_like += 1
+        elif param.kind == inspect.Parameter.VAR_POSITIONAL:
+            return True
+    return positional_like >= 1
+
+
+class JobProgressReporter:
+    def __init__(self, manager: "AsyncJobManager", job_id: str) -> None:
+        self._manager = manager
+        self._job_id = job_id
+        self._last_emit_ts = 0.0
+        self._last_pct = -1.0
+        self._last_message: str | None = None
+
+    def update(self, progress_pct: float | None = None, message: str | None = None, force: bool = False) -> None:
+        now = time.time()
+        pct = float(progress_pct) if progress_pct is not None else None
+        if pct is not None:
+            pct = max(0.0, min(100.0, pct))
+        msg = str(message) if message is not None else None
+
+        throttled = (
+            not force
+            and (pct is None or abs(pct - self._last_pct) < 0.5)
+            and (now - self._last_emit_ts) < 0.4
+        )
+        if throttled:
+            return
+
+        self._manager.update_progress(self._job_id, progress_pct=pct, status_message=msg)
+        self._last_emit_ts = now
+        if pct is not None:
+            self._last_pct = pct
+        if msg is not None:
+            self._last_message = msg
+
+    def __call__(self, progress_pct: float | None = None, message: str | None = None, force: bool = False) -> None:
+        self.update(progress_pct=progress_pct, message=message, force=force)
 
 
 class AsyncJobManager:
@@ -71,12 +122,14 @@ class AsyncJobManager:
             self._write_meta(meta)
             return meta
 
-    def submit(self, name: str, fn: Callable[[], Any]) -> str:
+    def submit(self, name: str, fn: Callable[..., Any]) -> str:
         job_id = uuid4().hex
         meta = {
             "job_id": job_id,
             "name": str(name),
             "status": "queued",
+            "progress_pct": 0.0,
+            "status_message": "Queued",
             "created_at": _utc_now_iso(),
             "started_at": None,
             "finished_at": None,
@@ -85,6 +138,7 @@ class AsyncJobManager:
             "result_type": None,
             "result_path": None,
             "result_preview": None,
+            "progress_log": [],
         }
         self._write_meta(meta)
 
@@ -122,22 +176,40 @@ class AsyncJobManager:
             "result_preview": payload,
         }
 
-    def _run_job(self, job_id: str, fn: Callable[[], Any]) -> None:
-        self._update_meta(job_id, status="running", started_at=_utc_now_iso(), error=None, traceback=None)
+    def _run_job(self, job_id: str, fn: Callable[..., Any]) -> None:
+        self._update_meta(
+            job_id,
+            status="running",
+            started_at=_utc_now_iso(),
+            error=None,
+            traceback=None,
+            progress_pct=0.0,
+            status_message="Starting",
+        )
+        reporter = JobProgressReporter(self, job_id)
+        reporter.update(0.0, "Starting", force=True)
         try:
-            result = fn()
+            if _function_accepts_progress_arg(fn):
+                result = fn(reporter)
+            else:
+                result = fn()
+                reporter.update(95.0, "Finalizing", force=True)
             result_payload = self._persist_result(job_id, result)
             self._update_meta(
                 job_id,
                 status="succeeded",
                 finished_at=_utc_now_iso(),
+                progress_pct=100.0,
+                status_message="Completed",
                 **result_payload,
             )
+            reporter.update(100.0, "Completed", force=True)
         except Exception as exc:
             self._update_meta(
                 job_id,
                 status="failed",
                 finished_at=_utc_now_iso(),
+                status_message="Failed",
                 error=str(exc),
                 traceback=traceback.format_exc(limit=30),
             )
@@ -160,6 +232,8 @@ class AsyncJobManager:
                     "job_id",
                     "name",
                     "status",
+                    "progress_pct",
+                    "status_message",
                     "created_at",
                     "started_at",
                     "finished_at",
@@ -170,6 +244,10 @@ class AsyncJobManager:
             )
 
         table = pd.DataFrame(rows)
+        if "progress_pct" not in table.columns:
+            table["progress_pct"] = 0.0
+        if "status_message" not in table.columns:
+            table["status_message"] = None
         return table.sort_values("created_at", ascending=False).reset_index(drop=True)
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
@@ -225,3 +303,38 @@ class AsyncJobManager:
             meta_path.unlink()
 
         return status in {"queued", "running", "succeeded", "failed"}
+
+    def update_progress(
+        self,
+        job_id: str,
+        progress_pct: float | None = None,
+        status_message: str | None = None,
+    ) -> None:
+        with self._lock:
+            meta = self._read_meta(job_id)
+            if meta is None:
+                return
+
+            if progress_pct is not None:
+                meta["progress_pct"] = max(0.0, min(100.0, float(progress_pct)))
+            if status_message is not None:
+                meta["status_message"] = str(status_message)
+
+            log = meta.get("progress_log")
+            if not isinstance(log, list):
+                log = []
+            if status_message is not None:
+                latest_msg = log[-1]["message"] if log and isinstance(log[-1], dict) and "message" in log[-1] else None
+                if status_message != latest_msg:
+                    log.append(
+                        {
+                            "time_utc": _utc_now_iso(),
+                            "progress_pct": float(meta.get("progress_pct", 0.0)),
+                            "message": str(status_message),
+                        }
+                    )
+                    if len(log) > 300:
+                        log = log[-300:]
+            meta["progress_log"] = log
+
+            self._write_meta(meta)

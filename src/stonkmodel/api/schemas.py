@@ -21,6 +21,10 @@ class TrainRequest(BaseModel):
     dataset_name: str = "model_dataset"
     interval: str | None = None
     min_pattern_rows: int | None = Field(default=None, ge=10, le=100000)
+    model_name: str | None = None
+    parallel_patterns: int | None = Field(default=None, ge=1, le=32)
+    fast_mode: bool = False
+    max_rows_per_pattern: int | None = Field(default=None, ge=1000, le=2000000)
 
 
 class BacktestRequest(BaseModel):
@@ -39,6 +43,11 @@ class BacktestRequest(BaseModel):
     test_window_days: int = Field(default=63, ge=5, le=730)
     step_days: int = Field(default=21, ge=1, le=365)
     min_pattern_rows: int | None = Field(default=None, ge=10, le=100000)
+    fast_mode: bool = False
+    parallel_models: int = Field(default=1, ge=1, le=64)
+    max_eval_rows_per_pattern: int | None = Field(default=None, ge=1000, le=20000000)
+    max_windows_per_pattern: int | None = Field(default=None, ge=1, le=20000)
+    max_train_rows_per_window: int | None = Field(default=None, ge=1000, le=20000000)
     include_patterns: list[str] | None = None
     include_model_files: list[str] | None = None
 

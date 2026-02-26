@@ -7,7 +7,7 @@ import errno
 import gc
 from pathlib import Path
 import time
-from typing import Iterable, Literal
+from typing import Callable, Iterable, Literal
 
 import httpx
 import pandas as pd
@@ -41,6 +41,7 @@ _FMP_INTERVAL_MAP = {
 }
 
 Provider = Literal["fmp", "polygon", "yfinance"]
+ProgressCallback = Callable[[float, str], None]
 
 
 @dataclass
@@ -100,7 +101,12 @@ class MarketDataClient:
         self.polygon_api_key = polygon_api_key
         self.workers = workers
 
-    def fetch(self, spec: DownloadSpec, refresh: bool = False) -> dict[str, pd.DataFrame]:
+    def fetch(
+        self,
+        spec: DownloadSpec,
+        refresh: bool = False,
+        progress_callback: ProgressCallback | None = None,
+    ) -> dict[str, pd.DataFrame]:
         interval = spec.interval
         if not self._supports_any_provider(interval):
             raise ValueError(f"Unsupported interval `{interval}`")
@@ -112,10 +118,20 @@ class MarketDataClient:
         remaining = list(spec.symbols)
         out: dict[str, pd.DataFrame] = {}
         saved = 0
+        total = max(1, len(spec.symbols))
+
+        def emit(done: int, message: str) -> None:
+            if progress_callback is None:
+                return
+            pct = max(0.0, min(100.0, (float(done) / float(total)) * 100.0))
+            progress_callback(pct, message)
+
+        emit(0, f"Fetching market data for {len(spec.symbols)} symbols")
 
         for provider in provider_order:
             if not remaining:
                 break
+            emit(len(out), f"Fetching with {provider} ({len(remaining)} symbols remaining)")
             if provider == "fmp":
                 frames = self._fetch_fmp(remaining, interval, spec.years)
             elif provider == "polygon":
@@ -128,6 +144,7 @@ class MarketDataClient:
                 if cleaned.empty:
                     continue
                 out[symbol] = cleaned
+                emit(len(out), f"{provider}: loaded {symbol} ({len(out)}/{total})")
                 if refresh:
                     self.store.save(symbol, interval, cleaned)
                     saved += 1
@@ -141,23 +158,46 @@ class MarketDataClient:
             cached = self.store.load(symbol, interval)
             if not cached.empty:
                 out[symbol] = cached
+                emit(len(out), f"Cache fallback: loaded {symbol} ({len(out)}/{total})")
+
+        emit(len(out), f"History fetch complete ({len(out)}/{total} symbols)")
 
         return out
 
-    def load_or_fetch(self, spec: DownloadSpec) -> dict[str, pd.DataFrame]:
+    def load_or_fetch(self, spec: DownloadSpec, progress_callback: ProgressCallback | None = None) -> dict[str, pd.DataFrame]:
         cached: dict[str, pd.DataFrame] = {}
         missing: list[str] = []
+        total = max(1, len(spec.symbols))
+
+        def emit(done: int, message: str) -> None:
+            if progress_callback is None:
+                return
+            pct = max(0.0, min(100.0, (float(done) / float(total)) * 100.0))
+            progress_callback(pct, message)
+
+        emit(0, f"Checking cache for {len(spec.symbols)} symbols")
         for symbol in spec.symbols:
             data = self.store.load(symbol, spec.interval)
             if data.empty:
                 missing.append(symbol)
             else:
                 cached[symbol] = data
+            emit(len(cached), f"Cache scan {len(cached)}/{total} hit(s), {len(missing)} missing")
 
         if not missing:
+            emit(len(cached), "All symbols loaded from cache")
             return cached
 
-        fetched = self.fetch(DownloadSpec(symbols=missing, interval=spec.interval, years=spec.years), refresh=True)
+        fetched = self.fetch(
+            DownloadSpec(symbols=missing, interval=spec.interval, years=spec.years),
+            refresh=True,
+            progress_callback=(
+                None
+                if progress_callback is None
+                else (lambda p, msg: progress_callback((len(cached) / total) * 100.0 + ((100.0 - ((len(cached) / total) * 100.0)) * (p / 100.0)), msg))
+            ),
+        )
+        emit(len(cached) + len(fetched), f"Cache + fetch complete ({len(cached) + len(fetched)}/{total})")
         return {**cached, **fetched}
 
     def _provider_order(self, interval: str) -> list[Provider]:
