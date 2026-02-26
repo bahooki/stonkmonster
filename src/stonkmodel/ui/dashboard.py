@@ -9,7 +9,6 @@ import streamlit as st
 
 from stonkmodel.config import get_settings
 from stonkmodel.pipeline import StonkService
-from stonkmodel.ui.jobs import AsyncJobManager
 
 st.set_page_config(page_title="StonkModel Control Center", layout="wide")
 
@@ -25,10 +24,6 @@ BACKTEST_MODE_LABEL_TO_VALUE = {
     "Saved Models (strict OOS)": "saved_models",
     "Walk-Forward Retrain": "walk_forward_retrain",
 }
-
-if "job_manager" not in st.session_state:
-    st.session_state["job_manager"] = AsyncJobManager(settings.data_dir / "jobs", max_workers=1)
-job_manager: AsyncJobManager = st.session_state["job_manager"]
 
 st.title("StonkModel Control Center")
 st.caption("Dataset updates, training, model registry, backtests, scanner, and analytics")
@@ -75,10 +70,7 @@ def _accepts_progress_callback(fn: Callable[..., Any]) -> bool:
     return False
 
 
-def _run_or_queue(name: str, run_async: bool, fn: Callable[..., Any]) -> tuple[str | None, Any | None]:
-    if run_async:
-        job_id = job_manager.submit(name=name, fn=fn)
-        return job_id, None
+def _run_inline(fn: Callable[..., Any]) -> Any:
     if _accepts_progress_callback(fn):
         progress_slot = st.empty()
         bar = progress_slot.progress(0.0, text="0.0% - Starting")
@@ -90,12 +82,8 @@ def _run_or_queue(name: str, run_async: bool, fn: Callable[..., Any]) -> tuple[s
             result = fn(_inline_progress)
         finally:
             progress_slot.empty()
-        return None, result
-    return None, fn()
-
-
-def _show_job_message(job_id: str) -> None:
-    st.success(f"Job queued: `{job_id}`. Check the Jobs tab for progress and results.")
+        return result
+    return fn()
 
 
 with st.sidebar:
@@ -104,8 +92,6 @@ with st.sidebar:
     st.write(f"Fundamentals provider: `{settings.fundamentals_provider}`")
     st.write(f"FMP key configured: `{bool(settings.fmp_api_key)}`")
     st.write(f"Polygon key configured: `{bool(settings.polygon_api_key)}`")
-
-    run_async_jobs = st.checkbox("Run heavy actions as background jobs", value=True)
 
     default_universe_label = "S&P 100" if settings.universe_source == "sp100" else "S&P 500"
     selected_universe_label = st.selectbox(
@@ -116,8 +102,8 @@ with st.sidebar:
     selected_universe = UNIVERSE_LABEL_TO_VALUE[selected_universe_label]
 
 
-tab_data, tab_train, tab_backtest, tab_scanner, tab_models, tab_analytics, tab_jobs, tab_config = st.tabs(
-    ["Data", "Train", "Backtest", "Scanner", "Models", "Analytics", "Jobs", "Config"]
+tab_data, tab_train, tab_backtest, tab_scanner, tab_models, tab_analytics, tab_config = st.tabs(
+    ["Data", "Train", "Backtest", "Scanner", "Models", "Analytics", "Config"]
 )
 
 with tab_data:
@@ -170,12 +156,9 @@ with tab_data:
                 "dataset_path": result.dataset_path,
             }
 
-        job_id, result_payload = _run_or_queue("build_dataset", run_async_jobs, _task)
-        if job_id is not None:
-            _show_job_message(job_id)
-        else:
-            st.session_state["last_build_result"] = result_payload
-            _load_dataset_registry.clear()
+        result_payload = _run_inline(_task)
+        st.session_state["last_build_result"] = result_payload
+        _load_dataset_registry.clear()
 
     if "last_build_result" in st.session_state:
         st.success("Dataset build complete")
@@ -269,12 +252,9 @@ with tab_train:
                     max_rows_per_pattern=None if int(train_max_rows_per_pattern) <= 0 else int(train_max_rows_per_pattern),
                 )
 
-            job_id, table = _run_or_queue("train_models", run_async_jobs, _task)
-            if job_id is not None:
-                _show_job_message(job_id)
-            else:
-                st.session_state["last_train_table"] = table
-                _load_model_registry.clear()
+            table = _run_inline(_task)
+            st.session_state["last_train_table"] = table
+            _load_model_registry.clear()
 
         if "last_train_table" in st.session_state:
             table = st.session_state["last_train_table"]
@@ -432,50 +412,35 @@ with tab_backtest:
                     max_train_rows_per_window=None if int(bt_max_train_rows) <= 0 else int(bt_max_train_rows),
                 )
 
-            job_id, bt = _run_or_queue("backtest", run_async_jobs, _task)
-            if job_id is not None:
-                st.session_state["last_backtest_job_id"] = job_id
-                _show_job_message(job_id)
-            else:
-                st.session_state["last_backtest_table"] = bt
-
-        backtest_job_id = st.session_state.get("last_backtest_job_id")
-        if backtest_job_id:
-            meta = job_manager.get_job(str(backtest_job_id))
-            if meta:
-                status = str(meta.get("status", "unknown"))
-                pct = float(meta.get("progress_pct", 0.0) or 0.0)
-                message = str(meta.get("status_message") or "")
-                st.info(f"Backtest job `{backtest_job_id[:10]}...` status: {status} ({pct:.1f}%) {message}")
-
-                col_refresh, col_clear = st.columns(2)
-                with col_refresh:
-                    if st.button("Refresh Backtest Job Status", key="refresh_backtest_job_status"):
-                        st.rerun()
-                with col_clear:
-                    if st.button("Clear Backtest Job Link", key="clear_backtest_job_link"):
-                        st.session_state.pop("last_backtest_job_id", None)
-                        st.rerun()
-
-                if status == "succeeded":
-                    result = job_manager.load_result(str(backtest_job_id))
-                    if isinstance(result, pd.DataFrame):
-                        st.session_state["last_backtest_table"] = result
-                        st.success("Async backtest completed and loaded.")
-                    elif result is not None:
-                        st.write("Backtest result payload")
-                        st.json(result)
-                elif status == "failed":
-                    st.error(f"Backtest job failed: {meta.get('error')}")
-            else:
-                st.warning("Tracked backtest job was not found in job history.")
+            with st.spinner("Running backtest..."):
+                bt = _run_inline(_task)
+            st.session_state["last_backtest_table"] = bt
 
         if "last_backtest_table" in st.session_state:
             bt = st.session_state["last_backtest_table"]
             if bt.empty:
                 st.warning("No backtest rows returned for the selected filters.")
             else:
-                st.dataframe(bt, use_container_width=True)
+                if {"backtest_start_datetime", "backtest_end_datetime"}.issubset(bt.columns):
+                    bt_start = pd.to_datetime(bt["backtest_start_datetime"], utc=True, errors="coerce").min()
+                    bt_end = pd.to_datetime(bt["backtest_end_datetime"], utc=True, errors="coerce").max()
+                    if pd.notna(bt_start) and pd.notna(bt_end):
+                        st.caption(f"Backtest range: {bt_start.isoformat()} to {bt_end.isoformat()}")
+
+                preferred_cols = [
+                    "pattern",
+                    "model_file",
+                    "backtest_start_datetime",
+                    "backtest_end_datetime",
+                    "windows_used",
+                    "trades",
+                    "win_rate",
+                    "avg_trade_return",
+                    "cumulative_return",
+                    "sharpe",
+                ]
+                ordered_cols = [c for c in preferred_cols if c in bt.columns] + [c for c in bt.columns if c not in preferred_cols]
+                st.dataframe(bt[ordered_cols], use_container_width=True)
 
 with tab_scanner:
     st.subheader("Run Scanner")
@@ -529,11 +494,9 @@ with tab_scanner:
                 short_threshold=None if scan_use_model_thresholds else float(scan_short_threshold),
             )
 
-        job_id, scan_table = _run_or_queue("scan", run_async_jobs, _task)
-        if job_id is not None:
-            _show_job_message(job_id)
-        else:
-            st.session_state["last_scan_table"] = scan_table
+        with st.spinner("Running scanner..."):
+            scan_table = _run_inline(_task)
+        st.session_state["last_scan_table"] = scan_table
 
     if "last_scan_table" in st.session_state:
         scan_table = st.session_state["last_scan_table"]
@@ -652,11 +615,9 @@ with tab_analytics:
                 universe=selected_universe,
             )
 
-        job_id, sweep = _run_or_queue("interval_sweep", run_async_jobs, _task)
-        if job_id is not None:
-            _show_job_message(job_id)
-        else:
-            st.session_state["last_sweep_table"] = sweep
+        with st.spinner("Running interval sweep..."):
+            sweep = _run_inline(_task)
+        st.session_state["last_sweep_table"] = sweep
 
     if "last_sweep_table" in st.session_state:
         sweep = st.session_state["last_sweep_table"]
@@ -664,86 +625,6 @@ with tab_analytics:
             st.warning("No sweep results returned.")
         else:
             st.dataframe(sweep, use_container_width=True)
-
-with tab_jobs:
-    st.subheader("Background Jobs")
-    jobs = job_manager.list_jobs()
-    if jobs.empty:
-        st.info("No jobs yet. Queue one from Data, Train, Backtest, Scanner, or Analytics tabs.")
-    else:
-        jobs_display = jobs.copy()
-        if "progress_pct" not in jobs_display.columns:
-            jobs_display["progress_pct"] = 0.0
-        if "status_message" not in jobs_display.columns:
-            jobs_display["status_message"] = None
-        jobs_display["progress_pct"] = jobs_display["progress_pct"].fillna(0.0).astype(float).round(1)
-        st.dataframe(
-            jobs_display[
-                [
-                    "job_id",
-                    "name",
-                    "status",
-                    "progress_pct",
-                    "status_message",
-                    "created_at",
-                    "started_at",
-                    "finished_at",
-                    "error",
-                ]
-            ],
-            use_container_width=True,
-        )
-
-        selected_job_id = st.selectbox(
-            "Inspect job",
-            options=jobs["job_id"].astype(str).tolist(),
-            format_func=lambda x: f"{x[:10]}...",
-        )
-        if selected_job_id:
-            details = job_manager.get_job(selected_job_id) or {}
-            pct = float(details.get("progress_pct", 0.0) or 0.0)
-            msg = details.get("status_message") or "Working"
-            st.progress(max(0.0, min(1.0, pct / 100.0)), text=f"{pct:.1f}% - {msg}")
-            st.json(
-                {
-                    "job_id": details.get("job_id"),
-                    "name": details.get("name"),
-                    "status": details.get("status"),
-                    "progress_pct": details.get("progress_pct"),
-                    "status_message": details.get("status_message"),
-                    "created_at": details.get("created_at"),
-                    "started_at": details.get("started_at"),
-                    "finished_at": details.get("finished_at"),
-                    "result_type": details.get("result_type"),
-                    "result_path": details.get("result_path"),
-                    "error": details.get("error"),
-                }
-            )
-
-            if details.get("traceback"):
-                st.code(str(details.get("traceback")), language="text")
-
-            progress_log = details.get("progress_log")
-            if isinstance(progress_log, list) and progress_log:
-                st.write("### Progress Log")
-                log_frame = pd.DataFrame(progress_log)
-                if not log_frame.empty:
-                    st.dataframe(log_frame.tail(40), use_container_width=True)
-
-            result = job_manager.load_result(selected_job_id)
-            if isinstance(result, pd.DataFrame):
-                st.write("### Result")
-                st.dataframe(result, use_container_width=True)
-            elif result is not None:
-                st.write("### Result")
-                st.json(result)
-
-            if st.button("Delete Job Record", key=f"delete_job_{selected_job_id}"):
-                deleted = job_manager.delete_job(selected_job_id)
-                if deleted:
-                    st.success("Job deleted")
-                else:
-                    st.warning("Cannot delete running job")
 
 with tab_config:
     st.subheader("Runtime Configuration")

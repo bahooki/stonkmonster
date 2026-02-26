@@ -27,24 +27,21 @@ class BacktestResult:
     avg_trade_return: float
     cumulative_return: float
     sharpe: float
+    backtest_start_datetime: str | None = None
+    backtest_end_datetime: str | None = None
 
-    def to_dict(self) -> dict[str, float | int | str]:
+    def to_dict(self) -> dict[str, float | int | str | None]:
         return {
             "pattern": self.pattern,
             "model_file": self.model_file,
+            "backtest_start_datetime": self.backtest_start_datetime,
+            "backtest_end_datetime": self.backtest_end_datetime,
             "trades": self.trades,
             "win_rate": self.win_rate,
             "avg_trade_return": self.avg_trade_return,
             "cumulative_return": self.cumulative_return,
             "sharpe": self.sharpe,
         }
-
-
-def _safe_sharpe(series: pd.Series) -> float:
-    std = series.std()
-    if std == 0 or np.isnan(std):
-        return 0.0
-    return float((series.mean() / std) * np.sqrt(252))
 
 
 def _bars_per_day(interval: str) -> float:
@@ -62,6 +59,53 @@ def _bars_per_day(interval: str) -> float:
 
 def _holding_days(interval: str, horizon_bars: int, latency_bars: int) -> float:
     return float(max(1, horizon_bars + max(0, latency_bars)) / _bars_per_day(interval))
+
+
+def _periods_per_year(interval: str) -> float:
+    return float(252.0 * _bars_per_day(interval))
+
+
+def _aggregate_returns_by_datetime(subset: pd.DataFrame, column: str = "strategy_return") -> pd.Series:
+    if subset.empty or column not in subset.columns:
+        return pd.Series(dtype=float)
+
+    returns = pd.to_numeric(subset[column], errors="coerce")
+    if "datetime" not in subset.columns:
+        return returns.dropna().astype(float).reset_index(drop=True)
+
+    dt = pd.to_datetime(subset["datetime"], utc=True, errors="coerce")
+    valid = dt.notna() & returns.notna()
+    if not bool(valid.any()):
+        return pd.Series(dtype=float)
+
+    frame = pd.DataFrame({"datetime": dt.loc[valid], "strategy_return": returns.loc[valid].astype(float)})
+    # Aggregate concurrent symbols/signals into one portfolio return per timestamp.
+    return frame.groupby("datetime", sort=True)["strategy_return"].mean()
+
+
+def _safe_cumulative_return(series: pd.Series) -> float:
+    if series.empty:
+        return 0.0
+    clean = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if clean.empty:
+        return 0.0
+    # Guard log1p domain while preserving normal return magnitudes.
+    clean = clean.clip(lower=-0.999999999)
+    return float(np.expm1(np.log1p(clean).sum()))
+
+
+def _safe_sharpe_for_interval(series: pd.Series, interval: str) -> float:
+    std = series.std()
+    if std == 0 or np.isnan(std):
+        return 0.0
+    return float((series.mean() / std) * np.sqrt(_periods_per_year(interval)))
+
+
+def _to_iso_utc(value: object) -> str | None:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.isoformat()
 
 
 def _extract_pattern_subset(frame: pd.DataFrame, pattern: str) -> pd.DataFrame:
@@ -98,6 +142,8 @@ def _compute_realized_return(
     lag = max(0, int(latency_bars))
     horizon = max(1, int(horizon_bars))
     for _, g in frame.groupby("symbol", sort=False):
+        if "datetime" in g.columns:
+            g = g.sort_values("datetime")
         entry = g["close"].shift(-lag)
         exit_ = g["close"].shift(-(lag + horizon))
         out.loc[g.index] = (exit_ / entry) - 1.0
@@ -180,10 +226,20 @@ def run_pattern_backtests(
 
     if not candidate_models:
         return pd.DataFrame(
-            columns=["pattern", "model_file", "trades", "win_rate", "avg_trade_return", "cumulative_return", "sharpe"]
+            columns=[
+                "pattern",
+                "model_file",
+                "backtest_start_datetime",
+                "backtest_end_datetime",
+                "trades",
+                "win_rate",
+                "avg_trade_return",
+                "cumulative_return",
+                "sharpe",
+            ]
         )
 
-    def evaluate_model(model_path, model_file: str) -> dict[str, float | int | str] | None:
+    def evaluate_model(model_path, model_file: str) -> dict[str, float | int | str | None] | None:
         try:
             payload = model_io.load_from_path(model_path)
         except Exception:
@@ -209,6 +265,17 @@ def run_pattern_backtests(
             eval_pool = default_test.copy()
         if eval_pool.empty:
             return None
+
+        eval_dt = pd.to_datetime(eval_pool["datetime"], utc=True, errors="coerce")
+        eval_start_iso = _to_iso_utc(eval_dt.min())
+        eval_end_iso = _to_iso_utc(eval_dt.max())
+
+        eval_pool = eval_pool.sort_values(["symbol", "datetime"]).copy()
+        eval_pool["realized_return"] = _compute_realized_return(
+            eval_pool,
+            horizon_bars=horizon_bars,
+            latency_bars=latency_bars,
+        )
 
         model = payload["model"]
         feature_cols = payload["feature_columns"]
@@ -236,7 +303,6 @@ def run_pattern_backtests(
         if subset.empty:
             return None
 
-        subset["realized_return"] = _compute_realized_return(subset, horizon_bars=horizon_bars, latency_bars=latency_bars)
         subset = subset.dropna(subset=["realized_return"]).copy()
         if subset.empty:
             return None
@@ -252,18 +318,21 @@ def run_pattern_backtests(
             latency_bars=latency_bars,
         )
 
+        period_returns = _aggregate_returns_by_datetime(subset, column="strategy_return")
         result = BacktestResult(
             pattern=pattern,
             model_file=model_file,
             trades=int(len(subset)),
             win_rate=float((subset["strategy_return"] > 0).mean()),
             avg_trade_return=float(subset["strategy_return"].mean()),
-            cumulative_return=float((1.0 + subset["strategy_return"]).prod() - 1.0),
-            sharpe=_safe_sharpe(subset["strategy_return"]),
+            cumulative_return=_safe_cumulative_return(period_returns),
+            sharpe=_safe_sharpe_for_interval(period_returns, interval=interval),
+            backtest_start_datetime=eval_start_iso,
+            backtest_end_datetime=eval_end_iso,
         )
         return result.to_dict()
 
-    rows: list[dict[str, float | int | str]] = []
+    rows: list[dict[str, float | int | str | None]] = []
     worker_count = max(1, int(parallel_models))
     if worker_count <= 1:
         for model_path, model_file in candidate_models:
@@ -286,7 +355,17 @@ def run_pattern_backtests(
 
     if not rows:
         return pd.DataFrame(
-            columns=["pattern", "model_file", "trades", "win_rate", "avg_trade_return", "cumulative_return", "sharpe"]
+            columns=[
+                "pattern",
+                "model_file",
+                "backtest_start_datetime",
+                "backtest_end_datetime",
+                "trades",
+                "win_rate",
+                "avg_trade_return",
+                "cumulative_return",
+                "sharpe",
+            ]
         )
     return pd.DataFrame(rows).sort_values("cumulative_return", ascending=False)
 
@@ -317,6 +396,11 @@ def run_walk_forward_retraining_backtests(
     work = work.dropna(subset=["datetime"]).copy()
     if work.empty:
         return pd.DataFrame()
+    work["_realized_return_full"] = _compute_realized_return(
+        work,
+        horizon_bars=horizon_bars,
+        latency_bars=latency_bars,
+    )
 
     min_dt = work["datetime"].min()
     max_dt = work["datetime"].max()
@@ -328,11 +412,15 @@ def run_walk_forward_retraining_backtests(
     if include_patterns:
         pattern_names = [p for p in pattern_names if p in include_patterns]
 
-    rows: list[dict[str, float | int | str]] = []
+    rows: list[dict[str, float | int | str | None]] = []
     for pattern in pattern_names:
         subset_pattern = _extract_pattern_subset(work, pattern=pattern)
         if subset_pattern.empty:
             continue
+        subset_pattern["realized_return"] = pd.to_numeric(
+            work.loc[subset_pattern.index, "_realized_return_full"],
+            errors="coerce",
+        )
 
         windows: list[tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]] = []
         cursor = test_start
@@ -345,6 +433,9 @@ def run_walk_forward_retraining_backtests(
             windows = windows[-int(max_windows_per_pattern) :]
 
         trade_returns: list[float] = []
+        trade_datetimes: list[pd.Timestamp] = []
+        used_window_starts: list[pd.Timestamp] = []
+        used_window_ends: list[pd.Timestamp] = []
         trades = 0
         windows_used = 0
         for train_start, window_start, test_end in windows:
@@ -417,11 +508,6 @@ def run_walk_forward_retraining_backtests(
             if test_win.empty:
                 continue
 
-            test_win["realized_return"] = _compute_realized_return(
-                test_win,
-                horizon_bars=horizon_bars,
-                latency_bars=latency_bars,
-            )
             test_win = test_win.dropna(subset=["realized_return"]).copy()
             if test_win.empty:
                 continue
@@ -437,7 +523,10 @@ def run_walk_forward_retraining_backtests(
                 latency_bars=latency_bars,
             )
 
+            trade_datetimes.extend(pd.to_datetime(test_win["datetime"], utc=True, errors="coerce").tolist())
             trade_returns.extend(test_win["strategy_return"].astype(float).tolist())
+            used_window_starts.append(window_start)
+            used_window_ends.append(test_end)
             trades += int(len(test_win))
             windows_used += 1
 
@@ -445,16 +534,24 @@ def run_walk_forward_retraining_backtests(
             continue
 
         strat = pd.Series(trade_returns, dtype=float)
+        period_returns = _aggregate_returns_by_datetime(
+            pd.DataFrame({"datetime": trade_datetimes, "strategy_return": trade_returns}),
+            column="strategy_return",
+        )
+        backtest_start_iso = _to_iso_utc(min(used_window_starts)) if used_window_starts else _to_iso_utc(min(trade_datetimes))
+        backtest_end_iso = _to_iso_utc(max(used_window_ends)) if used_window_ends else _to_iso_utc(max(trade_datetimes))
         rows.append(
             {
                 "pattern": pattern,
                 "model_file": "walk_forward_retrain",
+                "backtest_start_datetime": backtest_start_iso,
+                "backtest_end_datetime": backtest_end_iso,
                 "windows_used": int(windows_used),
                 "trades": int(trades),
                 "win_rate": float((strat > 0).mean()),
                 "avg_trade_return": float(strat.mean()),
-                "cumulative_return": float((1.0 + strat).prod() - 1.0),
-                "sharpe": _safe_sharpe(strat),
+                "cumulative_return": _safe_cumulative_return(period_returns),
+                "sharpe": _safe_sharpe_for_interval(period_returns, interval=interval),
             }
         )
 
@@ -463,6 +560,8 @@ def run_walk_forward_retraining_backtests(
             columns=[
                 "pattern",
                 "model_file",
+                "backtest_start_datetime",
+                "backtest_end_datetime",
                 "windows_used",
                 "trades",
                 "win_rate",
