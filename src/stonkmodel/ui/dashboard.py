@@ -1,0 +1,375 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+from stonkmodel.config import get_settings
+from stonkmodel.pipeline import StonkService
+
+st.set_page_config(page_title="StonkModel Control Center", layout="wide")
+
+settings = get_settings()
+service = StonkService(settings)
+
+INTERVAL_OPTIONS = ["1d", "1h", "30m", "15m", "5m", "1m"]
+UNIVERSE_LABEL_TO_VALUE = {
+    "S&P 500": "sp500",
+    "S&P 100": "sp100",
+}
+
+st.title("StonkModel Control Center")
+st.caption("Dataset updates, training, model registry, backtests, scanner, and analytics")
+
+with st.sidebar:
+    st.header("Runtime")
+    st.write(f"Market data provider: `{settings.market_data_provider}`")
+    st.write(f"Fundamentals provider: `{settings.fundamentals_provider}`")
+    st.write(f"FMP key configured: `{bool(settings.fmp_api_key)}`")
+    st.write(f"Polygon key configured: `{bool(settings.polygon_api_key)}`")
+    default_universe_label = "S&P 100" if settings.universe_source == "sp100" else "S&P 500"
+    selected_universe_label = st.selectbox(
+        "Universe (for market pulls)",
+        options=list(UNIVERSE_LABEL_TO_VALUE.keys()),
+        index=list(UNIVERSE_LABEL_TO_VALUE.keys()).index(default_universe_label),
+    )
+    selected_universe = UNIVERSE_LABEL_TO_VALUE[selected_universe_label]
+
+
+@st.cache_data(ttl=30)
+def _load_dataset_registry() -> pd.DataFrame:
+    return service.list_datasets()
+
+
+@st.cache_data(ttl=30)
+def _load_model_registry() -> pd.DataFrame:
+    return service.model_registry()
+
+
+def _dataset_names(frame: pd.DataFrame) -> list[str]:
+    if frame.empty:
+        return []
+    return frame["dataset_name"].dropna().astype(str).tolist()
+
+
+def _model_files(frame: pd.DataFrame) -> list[str]:
+    if frame.empty:
+        return []
+    return frame["model_file"].dropna().astype(str).tolist()
+
+
+def _pattern_names(frame: pd.DataFrame) -> list[str]:
+    if frame.empty or "pattern" not in frame.columns:
+        return []
+    return sorted(frame["pattern"].dropna().astype(str).unique().tolist())
+
+
+tab_data, tab_train, tab_backtest, tab_scanner, tab_models, tab_analytics, tab_config = st.tabs(
+    ["Data", "Train", "Backtest", "Scanner", "Models", "Analytics", "Config"]
+)
+
+with tab_data:
+    st.subheader("Build or Update Dataset")
+    with st.form("build_dataset_form"):
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            dataset_name = st.text_input("Dataset name", value="model_dataset")
+        with col2:
+            interval = st.selectbox("Interval", options=INTERVAL_OPTIONS, index=0)
+        with col3:
+            years_ago_range = st.slider(
+                "History window (years ago)",
+                min_value=0,
+                max_value=25,
+                value=(0, min(15, settings.history_years)),
+            )
+        st.caption("Example: selecting 5 and 10 keeps data between 10 and 5 years ago.")
+
+        col4, col5 = st.columns(2)
+        with col4:
+            refresh_prices = st.checkbox("Refresh prices from provider", value=True)
+        with col5:
+            politician_path_raw = st.text_input("Politician trades CSV (optional)", value="")
+
+        submitted = st.form_submit_button("Build / Update Dataset", use_container_width=True)
+
+    if submitted:
+        politician_path = Path(politician_path_raw).expanduser() if politician_path_raw else None
+        with st.spinner("Building dataset..."):
+            result = service.build_dataset(
+                interval=interval,
+                years=years_ago_range[1],
+                refresh_prices=refresh_prices,
+                dataset_name=dataset_name,
+                politician_trades_csv=politician_path,
+                universe=selected_universe,
+                years_ago_start=years_ago_range[0],
+                years_ago_end=years_ago_range[1],
+            )
+        st.session_state["last_build_result"] = {
+            "universe": result.universe,
+            "years_ago_start": result.years_ago_start,
+            "years_ago_end": result.years_ago_end,
+            "symbols_requested": result.symbols_requested,
+            "symbols_loaded": result.symbols_loaded,
+            "rows": result.rows,
+            "dataset_path": result.dataset_path,
+        }
+        _load_dataset_registry.clear()
+
+    if "last_build_result" in st.session_state:
+        st.success("Dataset build complete")
+        st.json(st.session_state["last_build_result"])
+
+    st.subheader("Dataset Registry")
+    datasets = _load_dataset_registry()
+    if datasets.empty:
+        st.info("No datasets found in data/processed yet.")
+    else:
+        st.dataframe(datasets, use_container_width=True)
+
+        choices = _dataset_names(datasets)
+        selected = st.selectbox("Inspect dataset", options=choices)
+        summary = service.dataset_summary(selected)
+        st.json(summary)
+
+        if st.button("Preview first 30 rows", key="preview_dataset_rows"):
+            frame = service.dataset_builder.load_dataset(selected).head(30)
+            st.dataframe(frame, use_container_width=True)
+
+with tab_train:
+    st.subheader("Train Pattern Models")
+    datasets = _load_dataset_registry()
+    choices = _dataset_names(datasets)
+    if not choices:
+        st.info("Build a dataset first.")
+    else:
+        with st.form("train_form"):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                train_dataset = st.selectbox("Dataset", options=choices, index=0)
+            with col2:
+                train_interval = st.selectbox("Interval", options=INTERVAL_OPTIONS, index=0)
+            with col3:
+                min_pattern_rows = st.number_input("Min rows per pattern", min_value=10, max_value=100000, value=settings.min_pattern_count)
+            submitted = st.form_submit_button("Train Models", use_container_width=True)
+
+        if submitted:
+            with st.spinner("Training..."):
+                table = service.train(
+                    dataset_name=train_dataset,
+                    interval=train_interval,
+                    min_pattern_rows=int(min_pattern_rows),
+                )
+            st.session_state["last_train_table"] = table
+            _load_model_registry.clear()
+
+        if "last_train_table" in st.session_state:
+            table = st.session_state["last_train_table"]
+            if table.empty:
+                st.warning("No models trained. Increase history or lower min rows.")
+            else:
+                st.success(f"Trained {len(table)} models")
+                st.dataframe(table, use_container_width=True)
+
+with tab_backtest:
+    st.subheader("Backtest Models")
+    datasets = _load_dataset_registry()
+    models = _load_model_registry()
+    dataset_choices = _dataset_names(datasets)
+
+    if not dataset_choices:
+        st.info("Build a dataset first.")
+    else:
+        with st.form("backtest_form"):
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                bt_dataset = st.selectbox("Dataset", options=dataset_choices, index=0)
+            with col2:
+                bt_interval = st.selectbox("Interval", options=INTERVAL_OPTIONS, index=0)
+            with col3:
+                long_threshold = st.slider("Long threshold", min_value=0.5, max_value=0.95, value=0.55, step=0.01)
+            with col4:
+                short_threshold = st.slider("Short threshold", min_value=0.05, max_value=0.5, value=0.45, step=0.01)
+
+            fee_bps = st.number_input("Fee bps", min_value=0.0, max_value=1000.0, value=1.0, step=0.1)
+
+            model_options = _model_files(models.loc[models["interval"] == bt_interval]) if not models.empty else []
+            pattern_options = _pattern_names(models)
+            selected_model_files = st.multiselect("Filter model files (optional)", options=model_options, default=[])
+            selected_patterns = st.multiselect("Filter patterns (optional)", options=pattern_options, default=[])
+
+            submitted = st.form_submit_button("Run Backtest", use_container_width=True)
+
+        if submitted:
+            with st.spinner("Running backtest..."):
+                bt = service.backtest(
+                    dataset_name=bt_dataset,
+                    interval=bt_interval,
+                    long_threshold=float(long_threshold),
+                    short_threshold=float(short_threshold),
+                    fee_bps=float(fee_bps),
+                    include_patterns=set(selected_patterns) or None,
+                    include_model_files=set(selected_model_files) or None,
+                )
+            st.session_state["last_backtest_table"] = bt
+
+        if "last_backtest_table" in st.session_state:
+            bt = st.session_state["last_backtest_table"]
+            if bt.empty:
+                st.warning("No backtest rows returned for the selected filters.")
+            else:
+                st.dataframe(bt, use_container_width=True)
+
+with tab_scanner:
+    st.subheader("Run Scanner")
+    models = _load_model_registry()
+
+    with st.form("scan_form"):
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            scan_interval = st.selectbox("Interval", options=INTERVAL_OPTIONS, index=0)
+        with col2:
+            scan_years = st.slider("History years for scan context", min_value=1, max_value=10, value=2)
+        with col3:
+            scan_top_n = st.slider("Top N", min_value=1, max_value=300, value=settings.top_n_signals)
+        with col4:
+            scan_min_conf = st.slider("Min confidence", min_value=0.0, max_value=1.0, value=0.5, step=0.01)
+
+        refresh_prices = st.checkbox("Refresh prices before scanning", value=True)
+        pol_path_raw = st.text_input("Politician trades CSV (optional)", value="")
+
+        model_options = _model_files(models.loc[models["interval"] == scan_interval]) if not models.empty else []
+        pattern_options = _pattern_names(models)
+        scan_model_files = st.multiselect("Filter model files (optional)", options=model_options, default=[])
+        scan_patterns = st.multiselect("Filter patterns (optional)", options=pattern_options, default=[])
+
+        submitted = st.form_submit_button("Run Scanner", use_container_width=True)
+
+    if submitted:
+        pol_path = Path(pol_path_raw).expanduser() if pol_path_raw else None
+        with st.spinner("Scanning..."):
+            scan_table = service.scan(
+                interval=scan_interval,
+                years=int(scan_years),
+                top_n=int(scan_top_n),
+                refresh_prices=refresh_prices,
+                politician_trades_csv=pol_path,
+                include_patterns=set(scan_patterns) or None,
+                include_model_files=set(scan_model_files) or None,
+                min_confidence=float(scan_min_conf),
+                universe=selected_universe,
+            )
+        st.session_state["last_scan_table"] = scan_table
+
+    if "last_scan_table" in st.session_state:
+        scan_table = st.session_state["last_scan_table"]
+        if scan_table.empty:
+            st.warning("No scan signals for current filters.")
+        else:
+            st.dataframe(scan_table, use_container_width=True)
+
+with tab_models:
+    st.subheader("Historical Model Registry")
+    models = _load_model_registry()
+    if models.empty:
+        st.info("No saved models yet.")
+    else:
+        st.dataframe(models, use_container_width=True)
+
+        model_file = st.selectbox("Inspect model file", options=_model_files(models), index=0)
+        top_n_imp = st.slider("Top importance rows", min_value=5, max_value=100, value=30)
+        if st.button("Load Model Details", use_container_width=True):
+            details = service.model_details(model_file=model_file, top_n_importance=int(top_n_imp))
+            st.session_state["model_details"] = details
+
+    if "model_details" in st.session_state:
+        details = st.session_state["model_details"]
+        st.write("### Model Metadata")
+        st.json({
+            "model_file": details.get("model_file"),
+            "pattern": details.get("pattern"),
+            "interval": details.get("interval"),
+            "horizon_bars": details.get("horizon_bars"),
+            "metrics": details.get("metrics"),
+            "train_rows": details.get("train_rows"),
+            "test_rows": details.get("test_rows"),
+            "feature_count": details.get("feature_count"),
+        })
+
+        importance = pd.DataFrame(details.get("importance", []))
+        if not importance.empty:
+            st.write("### Feature Importance")
+            st.dataframe(importance, use_container_width=True)
+
+with tab_analytics:
+    st.subheader("Analytics")
+
+    datasets = _load_dataset_registry()
+    dataset_choices = _dataset_names(datasets)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("#### Pattern Coverage")
+        if dataset_choices:
+            coverage_dataset = st.selectbox("Dataset for coverage", options=dataset_choices, key="coverage_dataset")
+            coverage = service.coverage(coverage_dataset)
+            if coverage.empty:
+                st.info("No coverage data available.")
+            else:
+                st.dataframe(coverage, use_container_width=True)
+                st.bar_chart(coverage.set_index("pattern")["count"])
+        else:
+            st.info("No datasets available.")
+
+    with col2:
+        st.write("#### Feature Importance Summary")
+        imp_interval = st.selectbox("Interval", options=["all", *INTERVAL_OPTIONS], index=1)
+        imp_top_n = st.slider("Top N per pattern", min_value=5, max_value=100, value=20)
+        table = service.feature_importance(
+            interval=None if imp_interval == "all" else imp_interval,
+            horizon_bars=settings.forward_horizon_bars,
+            top_n_per_pattern=int(imp_top_n),
+        )
+        if table.empty:
+            st.info("No feature importance reports yet.")
+        else:
+            st.dataframe(table, use_container_width=True)
+
+    st.write("#### Interval Sweep")
+    with st.form("sweep_form"):
+        sweep_intervals = st.multiselect("Intervals", options=INTERVAL_OPTIONS, default=["1d", "1h", "30m", "15m"])
+        sweep_years = st.slider("Years", min_value=1, max_value=15, value=min(10, settings.history_years))
+        sweep_dataset_prefix = st.text_input("Dataset prefix", value="model_dataset")
+        sweep_refresh = st.checkbox("Refresh prices", value=False)
+        submitted = st.form_submit_button("Run Interval Sweep", use_container_width=True)
+
+    if submitted:
+        with st.spinner("Sweeping intervals..."):
+            sweep = service.sweep_intervals(
+                intervals=sweep_intervals,
+                years=sweep_years,
+                refresh_prices=sweep_refresh,
+                base_dataset_name=sweep_dataset_prefix,
+                universe=selected_universe,
+            )
+        st.session_state["last_sweep_table"] = sweep
+
+    if "last_sweep_table" in st.session_state:
+        sweep = st.session_state["last_sweep_table"]
+        if sweep.empty:
+            st.warning("No sweep results returned.")
+        else:
+            st.dataframe(sweep, use_container_width=True)
+
+with tab_config:
+    st.subheader("Runtime Configuration")
+    cfg = service.settings_dict()
+    cfg["fmp_api_key_set"] = bool(settings.fmp_api_key)
+    cfg["polygon_api_key_set"] = bool(settings.polygon_api_key)
+    cfg.pop("fmp_api_key", None)
+    cfg.pop("polygon_api_key", None)
+    st.json(cfg)
+
+    st.caption("Set environment variables in .env to control providers and credentials.")

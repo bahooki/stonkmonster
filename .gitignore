@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+.venv314/
+.env
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.DS_Store
+tmp_fd_test/
+models/*.joblib
+models/*.importance.parquet
+models/*.meta.json
+data/raw/*.parquet
+data/processed/*.parquet
+data/processed/*_symbols_cache.csv
