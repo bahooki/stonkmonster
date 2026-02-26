@@ -434,9 +434,41 @@ with tab_backtest:
 
             job_id, bt = _run_or_queue("backtest", run_async_jobs, _task)
             if job_id is not None:
+                st.session_state["last_backtest_job_id"] = job_id
                 _show_job_message(job_id)
             else:
                 st.session_state["last_backtest_table"] = bt
+
+        backtest_job_id = st.session_state.get("last_backtest_job_id")
+        if backtest_job_id:
+            meta = job_manager.get_job(str(backtest_job_id))
+            if meta:
+                status = str(meta.get("status", "unknown"))
+                pct = float(meta.get("progress_pct", 0.0) or 0.0)
+                message = str(meta.get("status_message") or "")
+                st.info(f"Backtest job `{backtest_job_id[:10]}...` status: {status} ({pct:.1f}%) {message}")
+
+                col_refresh, col_clear = st.columns(2)
+                with col_refresh:
+                    if st.button("Refresh Backtest Job Status", key="refresh_backtest_job_status"):
+                        st.rerun()
+                with col_clear:
+                    if st.button("Clear Backtest Job Link", key="clear_backtest_job_link"):
+                        st.session_state.pop("last_backtest_job_id", None)
+                        st.rerun()
+
+                if status == "succeeded":
+                    result = job_manager.load_result(str(backtest_job_id))
+                    if isinstance(result, pd.DataFrame):
+                        st.session_state["last_backtest_table"] = result
+                        st.success("Async backtest completed and loaded.")
+                    elif result is not None:
+                        st.write("Backtest result payload")
+                        st.json(result)
+                elif status == "failed":
+                    st.error(f"Backtest job failed: {meta.get('error')}")
+            else:
+                st.warning("Tracked backtest job was not found in job history.")
 
         if "last_backtest_table" in st.session_state:
             bt = st.session_state["last_backtest_table"]
