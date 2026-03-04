@@ -1,0 +1,1 @@
+{"universe": "sp500", "years_ago_start": 0, "years_ago_end": 10, "symbols_requested": 503, "symbols_loaded": 498, "rows": 1082005, "dataset_path": "data/processed/s&p500_10yr_1d.parquet"}

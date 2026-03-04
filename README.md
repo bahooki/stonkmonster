@@ -10,9 +10,17 @@ This app builds separate models per candlestick pattern (for example `bearish_en
 - Optional external features:
   - Fundamental ratios (`yfinance`)
   - Politician trade flow (via normalized CSV you provide)
+  - Macro regime/event features (FRED + FMP treasury/economic calendar + yfinance macro proxies)
 - Stacked ensemble training (tree models + optional LightGBM/XGBoost/CatBoost)
 - Automatic feature pruning (missingness/constant/correlation + permutation-importance selection)
 - Automated permutation-based feature importance per pattern model
+- Return-first threshold optimizer on strict OOS slices (can persist tuned thresholds back into model artifacts)
+- Recursive train -> backtest -> keep-best-patterns -> re-train loop for iterative strategy refinement
+- Research-backed spread overlays in backtest:
+  - model-vs-model relative-strength spread
+  - pattern-vs-pattern relative-strength spread
+  - beta/size neutral overlay
+  - regime-conditioned spread switching + optional volatility targeting
 - Per-pattern backtesting and live scanning
 - FastAPI endpoints + Streamlit control center
 
@@ -68,10 +76,16 @@ streamlit run src/stonkmodel/ui/dashboard.py
 The Streamlit app includes end-to-end operations:
 - Dataset build/update and registry
 - Model training and result tables
+- Recursive return optimization workflows
 - Backtesting with model/pattern filters and threshold controls
+- Saved-model threshold optimization from OOS backtest results
 - Scanner runs with confidence and model filters
 - Historical saved model registry/details/feature importance
 - Pattern coverage, interval sweeps, and runtime config view
+
+Spread strategy research mapping and citations:
+
+- [`docs/spread_strategy_research.md`](docs/spread_strategy_research.md)
 
 ## End-to-end CLI flow
 
@@ -117,6 +131,31 @@ python scripts/sweep_intervals.py --intervals 1d 1h 30m 15m --years 10
 python scripts/report_feature_importance.py --interval 1d --top-n 25
 ```
 
+7) Optional recursive optimization loop (API)
+
+Use FastAPI `POST /train/recursive` to iteratively:
+- train models
+- optimize thresholds from OOS backtest slices
+- keep top patterns by backtest return
+- retrain next round on kept patterns
+
+8) Optional threshold optimization only (API)
+
+Use FastAPI `POST /thresholds/optimize` to tune/persist per-model long/short thresholds without retraining.
+
+9) Optional autopilot improvement loop
+
+```bash
+python scripts/auto_improve.py \
+  --dataset-name s\&p500_25yr_1d \
+  --interval 1d \
+  --iterations 8 \
+  --max-minutes 180 \
+  --min-iteration-trades 40
+```
+
+This runs repeated train -> threshold-optimize -> strict-OOS backtest cycles and stops early on no improvement or runtime cap.
+
 ## Environment variables
 
 Create `.env` (optional):
@@ -132,6 +171,7 @@ FUNDAMENTALS_PROVIDER=auto
 # Recommended for premium feeds
 FMP_API_KEY=your_fmp_key_here
 FMP_BASE_URL=https://financialmodelingprep.com/stable
+FRED_API_KEY=your_fred_key_here
 
 FORWARD_HORIZON_BARS=1
 RETURN_THRESHOLD=0.0

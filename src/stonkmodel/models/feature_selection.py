@@ -7,6 +7,7 @@ import pandas as pd
 from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
+from sklearn.model_selection import TimeSeriesSplit
 
 from stonkmodel.models.importance import ImportanceConfig, compute_permutation_feature_importance
 
@@ -21,8 +22,13 @@ class FeatureSelectionConfig:
     min_validation_rows: int = 80
     validation_fraction: float = 0.2
     min_importance: float = 0.0
+    importance_cum_share: float = 0.9
     sample_for_correlation: int = 8000
     random_state: int = 42
+    stability_n_splits: int = 4
+    stability_min_support: float = 0.55
+    stability_top_feature_fraction: float = 0.35
+    stability_min_contexts: int = 2
 
 
 @dataclass
@@ -35,6 +41,8 @@ class FeatureSelectionResult:
     dropped_constant: int
     dropped_correlated: int
     dropped_low_importance: int
+    dropped_unstable: int
+    stability_contexts: int
     importance: pd.DataFrame
 
 
@@ -82,6 +90,99 @@ def _ordered_intersection(ordered_columns: list[str], selected: list[str]) -> li
     return [col for col in ordered_columns if col in selected_set]
 
 
+def _top_features_by_importance(
+    importance_values: pd.Series,
+    top_n: int,
+) -> list[str]:
+    work = pd.to_numeric(importance_values, errors="coerce").fillna(0.0)
+    if work.empty or top_n <= 0:
+        return []
+    top_n = min(int(top_n), len(work))
+    ranked = work.sort_values(ascending=False)
+    positive = ranked.loc[ranked > 0].head(top_n)
+    if not positive.empty:
+        return positive.index.tolist()
+    return ranked.head(top_n).index.tolist()
+
+
+def _stability_support_scores(
+    x: pd.DataFrame,
+    y: pd.Series,
+    cfg: FeatureSelectionConfig,
+) -> tuple[pd.Series, int]:
+    if x.empty or len(x.columns) == 0 or len(y) < max(120, cfg.min_validation_rows * 2):
+        return pd.Series(dtype=float), 0
+    if y.nunique() < 2:
+        return pd.Series(dtype=float), 0
+
+    columns = list(x.columns)
+    top_n = max(
+        cfg.min_features,
+        min(cfg.max_features, int(round(len(columns) * float(cfg.stability_top_feature_fraction)))),
+    )
+    support_counts = pd.Series(0.0, index=columns, dtype=float)
+    contexts = 0
+
+    n_splits = max(2, int(cfg.stability_n_splits))
+    if len(x) >= (n_splits + 1) * max(25, cfg.min_validation_rows // 2):
+        splitter = TimeSeriesSplit(n_splits=n_splits)
+        for split_idx, (train_idx, val_idx) in enumerate(splitter.split(x)):
+            if len(train_idx) < max(100, cfg.min_validation_rows) or len(val_idx) < max(20, cfg.min_validation_rows // 2):
+                continue
+            y_train = y.iloc[train_idx].astype(int)
+            if y_train.nunique() < 2:
+                continue
+            model = _build_selector_model(random_state=cfg.random_state + split_idx)
+            x_train = x.iloc[train_idx].fillna(x.iloc[train_idx].median(numeric_only=True)).fillna(0.0)
+            try:
+                model.fit(x_train, y_train)
+                feature_imp = pd.Series(
+                    model.named_steps["model"].feature_importances_,  # type: ignore[index]
+                    index=columns,
+                    dtype=float,
+                )
+            except Exception:
+                continue
+            selected_fold = _top_features_by_importance(feature_imp, top_n=top_n)
+            if not selected_fold:
+                continue
+            support_counts.loc[selected_fold] += 1.0
+            contexts += 1
+
+    regime_col = next((c for c in ("market_volatility_20", "volatility_20") if c in x.columns), None)
+    if regime_col is not None:
+        regime_series = pd.to_numeric(x[regime_col], errors="coerce")
+        regime_median = float(regime_series.median()) if regime_series.notna().any() else np.nan
+        if np.isfinite(regime_median):
+            for regime_offset, mask in enumerate([regime_series <= regime_median, regime_series > regime_median], start=100):
+                idx = x.index[mask.fillna(False)]
+                if len(idx) < max(100, cfg.min_validation_rows * 2):
+                    continue
+                x_reg = x.loc[idx].fillna(x.loc[idx].median(numeric_only=True)).fillna(0.0)
+                y_reg = y.loc[idx].astype(int)
+                if y_reg.nunique() < 2:
+                    continue
+                model = _build_selector_model(random_state=cfg.random_state + regime_offset)
+                try:
+                    model.fit(x_reg, y_reg)
+                    feature_imp = pd.Series(
+                        model.named_steps["model"].feature_importances_,  # type: ignore[index]
+                        index=columns,
+                        dtype=float,
+                    )
+                except Exception:
+                    continue
+                selected_regime = _top_features_by_importance(feature_imp, top_n=top_n)
+                if not selected_regime:
+                    continue
+                support_counts.loc[selected_regime] += 1.0
+                contexts += 1
+
+    if contexts <= 0:
+        return pd.Series(dtype=float), 0
+    return support_counts / float(contexts), contexts
+
+
 def select_features(
     x_train: pd.DataFrame,
     y_train: pd.Series,
@@ -98,6 +199,8 @@ def select_features(
             dropped_constant=0,
             dropped_correlated=0,
             dropped_low_importance=0,
+            dropped_unstable=0,
+            stability_contexts=0,
             importance=pd.DataFrame(),
         )
 
@@ -130,11 +233,15 @@ def select_features(
             dropped_constant=dropped_constant,
             dropped_correlated=dropped_correlated,
             dropped_low_importance=0,
+            dropped_unstable=0,
+            stability_contexts=0,
             importance=pd.DataFrame(),
         )
 
     importance = pd.DataFrame()
     selected = list(x_prefilter.columns)
+    stability_contexts = 0
+    dropped_unstable = 0
 
     can_score_importance = (
         len(x_prefilter) >= cfg.min_train_rows_for_importance
@@ -164,12 +271,48 @@ def select_features(
                 ),
             )
             if not importance.empty:
-                positive = importance.loc[importance["importance_mean"] > cfg.min_importance, "feature"].tolist()
-                if len(positive) >= cfg.min_features:
-                    selected = positive
+                imp = pd.to_numeric(importance["importance_mean"], errors="coerce").fillna(0.0).clip(lower=0.0)
+                importance_work = importance.copy()
+                importance_work["_imp"] = imp
+                positive = importance_work.loc[importance_work["_imp"] > max(0.0, float(cfg.min_importance)), "feature"].tolist()
+                if positive:
+                    pos_work = importance_work.loc[importance_work["feature"].isin(set(positive))].copy()
+                    total_imp = float(pos_work["_imp"].sum())
+                    if total_imp > 0:
+                        pos_work["_cum_share"] = (pos_work["_imp"] / total_imp).cumsum()
+                        keep = pos_work.loc[pos_work["_cum_share"] <= float(cfg.importance_cum_share), "feature"].tolist()
+                    else:
+                        keep = []
+                    floor_n = min(len(pos_work), max(1, int(cfg.min_features)))
+                    if len(keep) < floor_n:
+                        keep = pos_work["feature"].head(floor_n).tolist()
+                    selected = keep
                 else:
                     top_n = max(cfg.min_features, min(cfg.max_features, len(importance)))
                     selected = importance["feature"].head(top_n).tolist()
+
+    support_rate, stability_contexts = _stability_support_scores(x_prefilter, y_train, cfg)
+    if not support_rate.empty and int(stability_contexts) >= int(cfg.stability_min_contexts):
+        stable_features = support_rate.loc[support_rate >= float(cfg.stability_min_support)].index.tolist()
+        if stable_features:
+            before = len(selected)
+            selected = [c for c in selected if c in set(stable_features)]
+            dropped_unstable = max(0, before - len(selected))
+
+            if len(selected) < cfg.min_features:
+                # Backfill using most stable features, then importance order.
+                rank_stable = support_rate.sort_values(ascending=False).index.tolist()
+                rank_importance = (
+                    importance["feature"].tolist()
+                    if not importance.empty and "feature" in importance.columns
+                    else list(x_prefilter.columns)
+                )
+                for col in [*rank_stable, *rank_importance]:
+                    if col in selected or col not in x_prefilter.columns:
+                        continue
+                    selected.append(col)
+                    if len(selected) >= cfg.min_features:
+                        break
 
     if cfg.max_features > 0 and len(selected) > cfg.max_features:
         selected = selected[: cfg.max_features]
@@ -190,5 +333,7 @@ def select_features(
         dropped_constant=dropped_constant,
         dropped_correlated=dropped_correlated,
         dropped_low_importance=dropped_low_importance,
+        dropped_unstable=dropped_unstable,
+        stability_contexts=int(stability_contexts),
         importance=importance,
     )

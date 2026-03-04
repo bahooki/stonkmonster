@@ -38,6 +38,7 @@ class Settings(BaseSettings):
 
     fmp_api_key: str | None = None
     fmp_base_url: str = "https://financialmodelingprep.com/stable"
+    fred_api_key: str | None = None
 
     # Optional market data vendor keys for higher-resolution history.
     polygon_api_key: str | None = None
@@ -47,6 +48,7 @@ class Settings(BaseSettings):
     train_test_split_date: str | None = None
     forward_horizon_bars: int = 1
     return_threshold: float = 0.0
+    label_mode: Literal["excess", "absolute", "cross_sectional"] = "excess"
 
     # Scanner settings
     min_pattern_count: int = 100

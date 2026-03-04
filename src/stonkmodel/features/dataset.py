@@ -10,9 +10,11 @@ import pandas as pd
 from stonkmodel.data.external_features import (
     build_fundamental_table,
     engineer_politician_features,
+    fetch_politician_trades_fmp,
     load_politician_trades,
     merge_external_features,
 )
+from stonkmodel.data.macro import build_macro_feature_table
 from stonkmodel.data.market_data import merge_frames
 from stonkmodel.features.indicators import add_indicators, infer_feature_columns
 from stonkmodel.features.labels import add_forward_labels, add_train_test_split
@@ -23,13 +25,16 @@ from stonkmodel.features.patterns import PATTERN_COLUMNS, add_candlestick_patter
 class DatasetOptions:
     horizon_bars: int = 1
     return_threshold: float = 0.0
+    label_mode: Literal["excess", "absolute", "cross_sectional"] = "excess"
     split_date: str | None = None
     politician_trades_csv: Path | None = None
     include_fundamentals: bool = True
     include_politician_trades: bool = True
+    include_macro_features: bool = True
     fundamentals_provider: Literal["auto", "fmp", "yfinance"] = "auto"
     fmp_api_key: str | None = None
     fmp_base_url: str = "https://financialmodelingprep.com/stable"
+    fred_api_key: str | None = None
     request_workers: int = 8
 
 
@@ -61,14 +66,53 @@ class DatasetBuilder:
             )
 
         politician = None
-        if options.include_politician_trades and options.politician_trades_csv:
-            raw = load_politician_trades(options.politician_trades_csv)
+        if options.include_politician_trades:
+            raw = pd.DataFrame()
+            if options.politician_trades_csv:
+                raw = load_politician_trades(options.politician_trades_csv)
+            if raw.empty and options.fmp_api_key:
+                dt = pd.to_datetime(work["datetime"], utc=True, errors="coerce")
+                raw = fetch_politician_trades_fmp(
+                    symbols=sorted(work["symbol"].dropna().astype(str).unique().tolist()),
+                    fmp_api_key=options.fmp_api_key,
+                    fmp_base_url=options.fmp_base_url,
+                    start_datetime=dt.min(),
+                    end_datetime=dt.max(),
+                    request_workers=options.request_workers,
+                )
             if not raw.empty:
                 politician = engineer_politician_features(raw)
 
-        work = merge_external_features(work, fundamental_table=fundamentals, politician_features=politician)
+        macro = None
+        if options.include_macro_features:
+            dt = pd.to_datetime(work["datetime"], utc=True, errors="coerce")
+            dt_start = dt.min()
+            dt_end = dt.max()
+            if pd.notna(dt_start) and pd.notna(dt_end):
+                macro = build_macro_feature_table(
+                    cache_path=self.processed_dir / "macro_features.parquet",
+                    start_datetime=dt_start,
+                    end_datetime=dt_end,
+                    refresh=False,
+                    fmp_api_key=options.fmp_api_key,
+                    fmp_base_url=options.fmp_base_url,
+                    fred_api_key=options.fred_api_key,
+                    request_workers=options.request_workers,
+                )
 
-        work = add_forward_labels(work, horizon_bars=options.horizon_bars, threshold=options.return_threshold)
+        work = merge_external_features(
+            work,
+            fundamental_table=fundamentals,
+            politician_features=politician,
+            macro_features=macro,
+        )
+
+        work = add_forward_labels(
+            work,
+            horizon_bars=options.horizon_bars,
+            threshold=options.return_threshold,
+            label_mode=options.label_mode,
+        )
         work = add_train_test_split(work, split_date=options.split_date)
 
         work = work.replace([np.inf, -np.inf], np.nan)

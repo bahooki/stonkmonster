@@ -34,6 +34,14 @@ def main() -> None:
     parser.add_argument("--max-eval-rows-per-pattern", type=int, default=None, help="Cap eval rows per pattern in saved-model mode")
     parser.add_argument("--max-windows-per-pattern", type=int, default=None, help="Cap walk-forward windows per pattern")
     parser.add_argument("--max-train-rows-per-window", type=int, default=None, help="Cap walk-forward train rows per window")
+    parser.add_argument("--include-spread-strategies", action="store_true", help="Include spread overlays (model-vs-model, pattern-vs-pattern, regime)")
+    parser.add_argument("--spread-lookback-bars", type=int, default=63, help="Lookback bars for spread relative-strength ranking")
+    parser.add_argument("--spread-top-components", type=int, default=3, help="Top/bottom components considered for spread pairing")
+    parser.add_argument("--spread-min-edge", type=float, default=0.02, help="Minimum score edge to activate a spread trade")
+    parser.add_argument("--spread-switch-cost-bps", type=float, default=0.0, help="Switching/friction cost when spread pair changes")
+    parser.add_argument("--spread-no-neutral-overlay", action="store_true", help="Disable beta/size neutral spread overlay variants")
+    parser.add_argument("--spread-no-regime-switch", action="store_true", help="Disable regime-conditioned spread switching variant")
+    parser.add_argument("--spread-target-vol-annual", type=float, default=0.0, help="Annualized volatility target for spread returns (0 disables)")
     parser.add_argument("--pattern", action="append", default=None, help="Optional pattern filter, repeatable")
     parser.add_argument("--model-file", action="append", default=None, help="Optional model file filter, repeatable")
     args = parser.parse_args()
@@ -60,6 +68,14 @@ def main() -> None:
         max_eval_rows_per_pattern=args.max_eval_rows_per_pattern,
         max_windows_per_pattern=args.max_windows_per_pattern,
         max_train_rows_per_window=args.max_train_rows_per_window,
+        include_spread_strategies=args.include_spread_strategies,
+        spread_lookback_bars=args.spread_lookback_bars,
+        spread_top_components=args.spread_top_components,
+        spread_min_edge=args.spread_min_edge,
+        spread_switch_cost_bps=args.spread_switch_cost_bps,
+        spread_include_neutral_overlay=(not args.spread_no_neutral_overlay),
+        spread_include_regime_switch=(not args.spread_no_regime_switch),
+        spread_target_vol_annual=args.spread_target_vol_annual,
         include_patterns=set(args.pattern or []) or None,
         include_model_files=set(args.model_file or []) or None,
     )

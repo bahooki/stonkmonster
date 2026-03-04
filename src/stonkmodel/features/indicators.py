@@ -39,15 +39,21 @@ def _add_base_features(group: pd.DataFrame) -> pd.DataFrame:
     g["hl_spread"] = (high - low) / close
     g["co_spread"] = (g["close"] - g["open"]) / g["open"].replace(0, np.nan)
     g["gap"] = (g["open"] - g["close"].shift(1)) / g["close"].shift(1)
+    g["dollar_volume"] = close * volume
+    g["log_dollar_volume"] = np.log1p(g["dollar_volume"].clip(lower=0))
 
     for window in (5, 10, 20, 50, 100, 200):
         g[f"volatility_{window}"] = g["ret_1"].rolling(window=window, min_periods=max(5, window // 2)).std()
         g[f"z_close_{window}"] = _rolling_zscore(close, window)
         g[f"z_volume_{window}"] = _rolling_zscore(volume, window)
+        g[f"dollar_volume_mean_{window}"] = g["dollar_volume"].rolling(window=window, min_periods=max(5, window // 3)).mean()
 
     g["range_to_atr20_proxy"] = (high - low) / (
         (high - low).rolling(20, min_periods=5).mean().replace(0, np.nan)
     )
+    g["amihud_illiquidity_20"] = (
+        g["ret_1"].abs() / g["dollar_volume"].replace(0, np.nan)
+    ).rolling(20, min_periods=5).mean()
     g["up_streak"] = (g["ret_1"] > 0).astype(int).groupby((g["ret_1"] <= 0).cumsum()).cumsum()
     g["down_streak"] = (g["ret_1"] < 0).astype(int).groupby((g["ret_1"] >= 0).cumsum()).cumsum()
     return g
@@ -378,7 +384,110 @@ def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
         enriched.append(g)
 
     out = pd.concat(enriched, ignore_index=True)
+    out = _add_market_context_features(out)
     out = out.replace([np.inf, -np.inf], np.nan)
+    return out
+
+
+def _add_market_context_features(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or "datetime" not in frame.columns:
+        return frame
+
+    out = frame.copy()
+    out["datetime"] = pd.to_datetime(out["datetime"], utc=True, errors="coerce")
+    out = out.dropna(subset=["datetime"]).copy()
+    if out.empty:
+        return frame
+
+    market = (
+        out.groupby("datetime", as_index=True)
+        .agg(
+            market_close=("close", "mean"),
+            breadth_up_share_1=("ret_1", lambda s: float((pd.to_numeric(s, errors="coerce") > 0).mean())),
+            breadth_down_share_1=("ret_1", lambda s: float((pd.to_numeric(s, errors="coerce") < 0).mean())),
+            cross_section_dispersion_1=("ret_1", lambda s: float(pd.to_numeric(s, errors="coerce").std())),
+        )
+        .sort_index()
+    )
+
+    market["market_return_1"] = market["market_close"].pct_change(1)
+    for window in (5, 10, 20, 63):
+        market[f"market_return_{window}"] = market["market_close"].pct_change(window)
+
+    market["market_volatility_20"] = market["market_return_1"].rolling(20, min_periods=5).std()
+    market["market_volatility_63"] = market["market_return_1"].rolling(63, min_periods=15).std()
+    market["market_trend_20"] = (
+        market["market_close"] / market["market_close"].rolling(20, min_periods=5).mean().replace(0, np.nan)
+    ) - 1.0
+    market["market_drawdown_63"] = (
+        market["market_close"] / market["market_close"].rolling(63, min_periods=10).max().replace(0, np.nan)
+    ) - 1.0
+    market["breadth_momentum_20"] = market["breadth_up_share_1"].rolling(20, min_periods=5).mean()
+
+    rolling_vol_median = market["market_volatility_20"].rolling(252, min_periods=30).median()
+    market["regime_low_vol_uptrend"] = (
+        (market["market_trend_20"] > 0) & (market["market_volatility_20"] <= rolling_vol_median)
+    ).astype(float)
+    market["regime_high_vol_downtrend"] = (
+        (market["market_trend_20"] < 0) & (market["market_volatility_20"] > rolling_vol_median)
+    ).astype(float)
+
+    out = out.merge(market.reset_index(), on="datetime", how="left")
+
+    for window in (5, 10, 20):
+        ret_col = f"ret_{window}"
+        market_col = f"market_return_{window}"
+        if ret_col in out.columns and market_col in out.columns:
+            out[f"alpha_ret_{window}"] = out[ret_col] - out[market_col]
+
+    if "ret_1" in out.columns and "breadth_up_share_1" in out.columns:
+        out["breadth_edge_1"] = (pd.to_numeric(out["ret_1"], errors="coerce") > 0).astype(float) - out["breadth_up_share_1"]
+
+    if {"symbol", "ret_1", "market_return_1"}.issubset(out.columns):
+        per_symbol: list[pd.DataFrame] = []
+        for _, g in out.groupby("symbol", sort=False):
+            x = g.sort_values("datetime").copy()
+            stock_ret = pd.to_numeric(x["ret_1"], errors="coerce")
+            market_ret = pd.to_numeric(x["market_return_1"], errors="coerce")
+            market_var_63 = market_ret.rolling(63, min_periods=20).var()
+            market_var_20 = market_ret.rolling(20, min_periods=10).var()
+            x["beta_63"] = stock_ret.rolling(63, min_periods=20).cov(market_ret) / market_var_63.replace(0, np.nan)
+            x["beta_20"] = stock_ret.rolling(20, min_periods=10).cov(market_ret) / market_var_20.replace(0, np.nan)
+            x["idiosyncratic_return_1"] = stock_ret - (x["beta_63"] * market_ret)
+            x["idiosyncratic_vol_20"] = x["idiosyncratic_return_1"].rolling(20, min_periods=5).std()
+            x["idiosyncratic_momentum_20"] = x["idiosyncratic_return_1"].rolling(20, min_periods=5).sum()
+            if "dollar_volume" in x.columns:
+                x["flow_shock_20"] = (
+                    (x["dollar_volume"] - x["dollar_volume"].rolling(20, min_periods=5).mean())
+                    / x["dollar_volume"].rolling(20, min_periods=5).std().replace(0, np.nan)
+                )
+            per_symbol.append(x)
+        out = pd.concat(per_symbol, ignore_index=True)
+
+    if "datetime" in out.columns:
+        for col in ("ret_5", "ret_20", "volatility_20"):
+            if col in out.columns:
+                out[f"cs_rank_{col}"] = out.groupby("datetime")[col].rank(pct=True)
+
+    # Calendar/seasonality covariates can capture earnings cadence,
+    # month-end flows, and options-expiration effects.
+    dt = pd.to_datetime(out["datetime"], utc=True, errors="coerce")
+    weekday = dt.dt.weekday
+    month = dt.dt.month
+    day_of_year = dt.dt.dayofyear
+    out["cal_weekday"] = weekday.astype(float)
+    out["cal_month"] = month.astype(float)
+    out["cal_weekday_sin"] = np.sin((2.0 * np.pi * weekday) / 7.0)
+    out["cal_weekday_cos"] = np.cos((2.0 * np.pi * weekday) / 7.0)
+    out["cal_month_sin"] = np.sin((2.0 * np.pi * (month - 1.0)) / 12.0)
+    out["cal_month_cos"] = np.cos((2.0 * np.pi * (month - 1.0)) / 12.0)
+    out["cal_doy_sin"] = np.sin((2.0 * np.pi * day_of_year) / 365.25)
+    out["cal_doy_cos"] = np.cos((2.0 * np.pi * day_of_year) / 365.25)
+    out["is_month_start"] = dt.dt.is_month_start.astype(float)
+    out["is_month_end"] = dt.dt.is_month_end.astype(float)
+    out["is_quarter_end"] = dt.dt.is_quarter_end.astype(float)
+    out["is_opex_friday"] = ((dt.dt.weekday == 4) & dt.dt.day.between(15, 21)).astype(float)
+
     return out
 
 
@@ -393,6 +502,9 @@ def infer_feature_columns(frame: pd.DataFrame, exclude: Iterable[str] | None = N
         "volume",
         "adj_close",
         "future_return",
+        "future_market_return",
+        "future_excess_return",
+        "future_rank_pct",
         "future_direction",
         "pattern",
         "split",

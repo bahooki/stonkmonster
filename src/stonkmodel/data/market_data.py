@@ -10,6 +10,7 @@ import time
 from typing import Callable, Iterable, Literal
 
 import httpx
+import numpy as np
 import pandas as pd
 import yfinance as yf
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -141,6 +142,7 @@ class MarketDataClient:
 
             for symbol, frame in frames.items():
                 cleaned = self._normalize_ohlcv(frame, symbol)
+                cleaned = self._clip_frame_to_years(cleaned, years=spec.years)
                 if cleaned.empty:
                     continue
                 out[symbol] = cleaned
@@ -156,6 +158,7 @@ class MarketDataClient:
         # Fallback to cache for symbols not fetched this round.
         for symbol in remaining:
             cached = self.store.load(symbol, interval)
+            cached = self._clip_frame_to_years(cached, years=spec.years)
             if not cached.empty:
                 out[symbol] = cached
                 emit(len(out), f"Cache fallback: loaded {symbol} ({len(out)}/{total})")
@@ -178,6 +181,7 @@ class MarketDataClient:
         emit(0, f"Checking cache for {len(spec.symbols)} symbols")
         for symbol in spec.symbols:
             data = self.store.load(symbol, spec.interval)
+            data = self._clip_frame_to_years(data, years=spec.years)
             if data.empty:
                 missing.append(symbol)
             else:
@@ -417,7 +421,18 @@ class MarketDataClient:
         rename_map = {}
         for col in frame.columns:
             lower = str(col).lower()
-            if lower in {"open", "high", "low", "close", "volume", "adj close", "adj_close", "adjclose"}:
+            if lower in {
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "adj close",
+                "adj_close",
+                "adjclose",
+                "adjustedclose",
+                "adjusted_close",
+            }:
                 rename_map[col] = lower.replace(" ", "_").replace("adjclose", "adj_close")
             elif col == dt_col:
                 rename_map[col] = "datetime"
@@ -433,11 +448,41 @@ class MarketDataClient:
             if col in out.columns:
                 out[col] = pd.to_numeric(out[col], errors="coerce")
 
+        # Normalize OHLC to adjusted-price space when available so split/corporate-action jumps
+        # don't create artificial returns and pattern artifacts.
+        if "adj_close" in out.columns:
+            close_raw = pd.to_numeric(out["close"], errors="coerce")
+            adj = pd.to_numeric(out["adj_close"], errors="coerce")
+            valid = close_raw.notna() & adj.notna() & (close_raw > 0) & (adj > 0)
+            if bool(valid.any()):
+                factor = pd.Series(1.0, index=out.index, dtype=float)
+                factor.loc[valid] = adj.loc[valid] / close_raw.loc[valid]
+                factor = factor.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+                for col in ("open", "high", "low", "close"):
+                    out[col] = pd.to_numeric(out[col], errors="coerce") * factor
+                out["close"] = adj.where(valid, out["close"])
+
         out["datetime"] = pd.to_datetime(out["datetime"], utc=True, errors="coerce")
         out = out.dropna(subset=["datetime", "open", "high", "low", "close", "volume"])
         out["symbol"] = symbol
         out = out.sort_values("datetime").drop_duplicates(subset=["datetime"]).reset_index(drop=True)
         return out
+
+    def _clip_frame_to_years(self, frame: pd.DataFrame, years: int) -> pd.DataFrame:
+        if frame.empty or "datetime" not in frame.columns:
+            return frame
+        lookback_years = max(1, int(years))
+        dt = pd.to_datetime(frame["datetime"], utc=True, errors="coerce")
+        if not bool(dt.notna().any()):
+            return pd.DataFrame()
+
+        now_utc = pd.Timestamp.now(tz="UTC")
+        start = now_utc - pd.DateOffset(years=lookback_years)
+        mask = dt >= start
+        clipped = frame.loc[mask].copy()
+        if clipped.empty:
+            return clipped
+        return clipped.sort_values("datetime").reset_index(drop=True)
 
 
 def merge_frames(frames: dict[str, pd.DataFrame]) -> pd.DataFrame:

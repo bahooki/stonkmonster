@@ -98,28 +98,21 @@ def build_stacking_classifier(random_state: int = 42, n_jobs: int = -1, fast_mod
         model_n_jobs = 1
 
     if fast_mode:
-        base_estimators: list[tuple[str, Any]] = [
-            (
-                "hgb",
-                HistGradientBoostingClassifier(
-                    learning_rate=0.06,
-                    max_iter=180,
-                    max_depth=6,
-                    min_samples_leaf=80,
-                    random_state=random_state,
-                ),
-            ),
-            (
-                "rf",
-                RandomForestClassifier(
-                    n_estimators=180,
-                    max_depth=8,
-                    min_samples_leaf=30,
-                    random_state=random_state,
-                    n_jobs=model_n_jobs,
-                ),
-            ),
-        ]
+        # Fast path intentionally avoids stacking CV overhead and uses
+        # a single strong learner to speed up iterative retraining.
+        fast_model = HistGradientBoostingClassifier(
+            learning_rate=0.06,
+            max_iter=160,
+            max_depth=6,
+            min_samples_leaf=80,
+            random_state=random_state,
+        )
+        return Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("model", fast_model),
+            ]
+        )
     else:
         base_estimators = [
             (
@@ -210,6 +203,7 @@ class PatternModelArtifact:
     test_start_datetime: str | None = None
     probability_calibration: dict[str, Any] | None = None
     tuned_thresholds: dict[str, Any] | None = None
+    meta_filter: dict[str, Any] | None = None
 
 
 class PatternModelIO:
@@ -238,9 +232,30 @@ class PatternModelIO:
         safe = f"{self._stem(pattern, interval, horizon_bars, model_name=model_name)}.meta.json"
         return self.models_dir / safe
 
+    @staticmethod
+    def _meta_path_for_model_path(model_path: Path) -> Path:
+        return model_path.with_suffix(".meta.json")
+
+    @staticmethod
+    def _importance_path_for_model_path(model_path: Path) -> Path:
+        return model_path.with_suffix(".importance.parquet")
+
+    @staticmethod
+    def _resolve_unique_model_path(base_path: Path) -> Path:
+        if not base_path.exists():
+            return base_path
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dt%H%M%S")
+        candidate = base_path.with_name(f"{base_path.stem}__v{stamp}{base_path.suffix}")
+        counter = 2
+        while candidate.exists():
+            candidate = base_path.with_name(f"{base_path.stem}__v{stamp}_{counter}{base_path.suffix}")
+            counter += 1
+        return candidate
+
     def save(self, artifact: PatternModelArtifact) -> Path:
         named = _sanitize_model_name(artifact.model_name)
         path = self._path(artifact.pattern, artifact.interval, artifact.horizon_bars, model_name=named)
+        path = self._resolve_unique_model_path(path)
         payload = {
             "pattern": artifact.pattern,
             "interval": artifact.interval,
@@ -255,6 +270,7 @@ class PatternModelIO:
             "test_start_datetime": artifact.test_start_datetime,
             "probability_calibration": artifact.probability_calibration or {},
             "tuned_thresholds": artifact.tuned_thresholds or {},
+            "meta_filter": artifact.meta_filter or {},
             "model": artifact.model,
         }
         joblib.dump(payload, path)
@@ -273,8 +289,14 @@ class PatternModelIO:
             "test_start_datetime": artifact.test_start_datetime,
             "probability_calibration": artifact.probability_calibration or {},
             "tuned_thresholds": artifact.tuned_thresholds or {},
+            "meta_filter": {
+                "enabled": bool((artifact.meta_filter or {}).get("enabled", False)),
+                "threshold": float((artifact.meta_filter or {}).get("threshold", 0.55)),
+                "train_rows": int((artifact.meta_filter or {}).get("train_rows", 0)),
+                "positive_rate": float((artifact.meta_filter or {}).get("positive_rate", 0.0)),
+            },
         }
-        self._meta_path(artifact.pattern, artifact.interval, artifact.horizon_bars, model_name=named).write_text(
+        self._meta_path_for_model_path(path).write_text(
             json.dumps(meta),
             encoding="utf-8",
         )
@@ -306,26 +328,112 @@ class PatternModelIO:
         model_path.unlink()
         removed_files.append(str(model_path))
 
+        extra_candidates: set[Path] = {
+            self._meta_path_for_model_path(model_path),
+            self._importance_path_for_model_path(model_path),
+        }
         parsed = self.parse_model_filename(model_path)
         pattern = parsed.get("pattern")
         interval = parsed.get("interval")
         horizon = parsed.get("horizon_bars")
         model_name = parsed.get("model_name")
         if pattern and interval and horizon is not None:
-            for extra_path in (
-                self._meta_path(str(pattern), str(interval), int(horizon), model_name=str(model_name) if model_name else None),
+            extra_candidates.add(
+                self._meta_path(str(pattern), str(interval), int(horizon), model_name=str(model_name) if model_name else None)
+            )
+            extra_candidates.add(
                 self._importance_path(
                     str(pattern),
                     str(interval),
                     int(horizon),
                     model_name=str(model_name) if model_name else None,
-                ),
-            ):
-                if extra_path.exists():
-                    extra_path.unlink()
-                    removed_files.append(str(extra_path))
+                )
+            )
+
+        for extra_path in extra_candidates:
+            if extra_path.exists():
+                extra_path.unlink()
+                removed_files.append(str(extra_path))
 
         return {"deleted": True, "removed_files": removed_files}
+
+    def delete_models(self, model_files: list[str | Path]) -> dict[str, object]:
+        requested: list[str] = []
+        seen: set[str] = set()
+        for item in list(model_files or []):
+            safe = Path(item).name
+            if not safe or safe in seen:
+                continue
+            seen.add(safe)
+            requested.append(safe)
+
+        deleted_models: list[str] = []
+        missing_or_invalid: list[str] = []
+        removed_files: list[str] = []
+        for safe in requested:
+            result = self.delete_model(safe)
+            if bool(result.get("deleted")):
+                deleted_models.append(safe)
+                removed_files.extend([str(x) for x in list(result.get("removed_files", []))])
+            else:
+                missing_or_invalid.append(safe)
+
+        return {
+            "requested_count": int(len(requested)),
+            "deleted_count": int(len(deleted_models)),
+            "missing_or_invalid_count": int(len(missing_or_invalid)),
+            "deleted_models": deleted_models,
+            "missing_or_invalid": missing_or_invalid,
+            "removed_files": removed_files,
+        }
+
+    def update_model_thresholds(
+        self,
+        model_file: str | Path,
+        tuned_thresholds: dict[str, Any],
+        optimization_meta: dict[str, Any] | None = None,
+    ) -> dict[str, object]:
+        safe_file = Path(model_file).name
+        model_path = self.models_dir / safe_file
+        if model_path.suffix != ".joblib" or not model_path.exists():
+            return {"updated": False, "model_file": safe_file}
+
+        payload = self.load_from_path(model_path)
+        payload["tuned_thresholds"] = dict(tuned_thresholds or {})
+        if optimization_meta is not None:
+            payload["threshold_optimization"] = dict(optimization_meta)
+        joblib.dump(payload, model_path)
+
+        parsed = self.parse_model_filename(model_path)
+        pattern = parsed.get("pattern")
+        interval = parsed.get("interval")
+        horizon = parsed.get("horizon_bars")
+        model_name = payload.get("model_name", parsed.get("model_name"))
+        meta_path = self._meta_path_for_model_path(model_path)
+        if not meta_path.exists() and pattern and interval and horizon is not None:
+            meta_path = self._meta_path(
+                str(pattern),
+                str(interval),
+                int(horizon),
+                model_name=str(model_name) if model_name else None,
+            )
+        if meta_path:
+            meta: dict[str, Any] = {}
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    meta = {}
+            meta["tuned_thresholds"] = dict(tuned_thresholds or {})
+            if optimization_meta is not None:
+                meta["threshold_optimization"] = dict(optimization_meta)
+            meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        return {
+            "updated": True,
+            "model_file": safe_file,
+            "tuned_thresholds": dict(tuned_thresholds or {}),
+        }
 
     def save_feature_importance(
         self,
@@ -334,9 +442,14 @@ class PatternModelIO:
         horizon_bars: int,
         frame: pd.DataFrame,
         model_name: str | None = None,
+        model_file: str | None = None,
     ) -> Path:
         named = _sanitize_model_name(model_name)
-        path = self._importance_path(pattern, interval, horizon_bars, model_name=named)
+        if model_file:
+            safe_model_file = Path(model_file).name
+            path = self._importance_path_for_model_path(self.models_dir / safe_model_file)
+        else:
+            path = self._importance_path(pattern, interval, horizon_bars, model_name=named)
         out = frame.copy()
         out["pattern"] = pattern
         out["interval"] = interval
@@ -351,8 +464,13 @@ class PatternModelIO:
         interval: str,
         horizon_bars: int,
         model_name: str | None = None,
+        model_file: str | None = None,
     ) -> pd.DataFrame:
-        path = self._importance_path(pattern, interval, horizon_bars, model_name=model_name)
+        if model_file:
+            safe_model_file = Path(model_file).name
+            path = self._importance_path_for_model_path(self.models_dir / safe_model_file)
+        else:
+            path = self._importance_path(pattern, interval, horizon_bars, model_name=model_name)
         if not path.exists():
             return pd.DataFrame()
         return pd.read_parquet(path)
@@ -464,21 +582,29 @@ class PatternModelIO:
                 "test_rows": np.nan,
                 "feature_count": np.nan,
                 "raw_feature_count": np.nan,
+                "purged_train_rows": np.nan,
+                "candidate_models_tested": np.nan,
+                "selected_random_seed": np.nan,
                 "train_end_datetime": None,
                 "test_start_datetime": None,
                 "tuned_long_threshold": np.nan,
                 "tuned_short_threshold": np.nan,
+                "meta_filter_enabled": False,
                 "importance_file": None,
             }
             meta_loaded = False
             if meta.get("interval") is not None and meta.get("horizon_bars") is not None:
-                meta_path = self._meta_path(
-                    str(meta.get("pattern")),
-                    str(meta.get("interval")),
-                    int(meta.get("horizon_bars")),
-                    model_name=str(meta.get("model_name")) if meta.get("model_name") else None,
-                )
-                if meta_path.exists():
+                meta_candidates = [
+                    self._meta_path_for_model_path(path),
+                    self._meta_path(
+                        str(meta.get("pattern")),
+                        str(meta.get("interval")),
+                        int(meta.get("horizon_bars")),
+                        model_name=str(meta.get("model_name")) if meta.get("model_name") else None,
+                    ),
+                ]
+                meta_path = next((candidate for candidate in meta_candidates if candidate.exists()), None)
+                if meta_path is not None:
                     try:
                         payload_meta = json.loads(meta_path.read_text(encoding="utf-8"))
                         row["model_name"] = payload_meta.get("model_name", row.get("model_name"))
@@ -493,11 +619,16 @@ class PatternModelIO:
                         row["feature_count"] = payload_meta.get("feature_count", np.nan)
                         fs = payload_meta.get("feature_selection", {}) or {}
                         row["raw_feature_count"] = fs.get("raw_feature_count", np.nan)
+                        row["purged_train_rows"] = fs.get("purged_train_rows", np.nan)
+                        row["candidate_models_tested"] = fs.get("candidate_models_tested", np.nan)
+                        row["selected_random_seed"] = fs.get("selected_random_seed", np.nan)
                         row["train_end_datetime"] = payload_meta.get("train_end_datetime")
                         row["test_start_datetime"] = payload_meta.get("test_start_datetime")
                         tuned = payload_meta.get("tuned_thresholds", {}) or {}
                         row["tuned_long_threshold"] = tuned.get("long", np.nan)
                         row["tuned_short_threshold"] = tuned.get("short", np.nan)
+                        meta_filter = payload_meta.get("meta_filter", {}) or {}
+                        row["meta_filter_enabled"] = bool(meta_filter.get("enabled", False))
                         meta_loaded = True
                     except Exception:
                         meta_loaded = False
@@ -517,22 +648,31 @@ class PatternModelIO:
                     row["feature_count"] = len(payload.get("feature_columns", []))
                     fs = payload.get("feature_selection", {}) or {}
                     row["raw_feature_count"] = fs.get("raw_feature_count", np.nan)
+                    row["purged_train_rows"] = fs.get("purged_train_rows", np.nan)
+                    row["candidate_models_tested"] = fs.get("candidate_models_tested", np.nan)
+                    row["selected_random_seed"] = fs.get("selected_random_seed", np.nan)
                     row["train_end_datetime"] = payload.get("train_end_datetime")
                     row["test_start_datetime"] = payload.get("test_start_datetime")
                     tuned = payload.get("tuned_thresholds", {}) or {}
                     row["tuned_long_threshold"] = tuned.get("long", np.nan)
                     row["tuned_short_threshold"] = tuned.get("short", np.nan)
+                    meta_filter = payload.get("meta_filter", {}) or {}
+                    row["meta_filter_enabled"] = bool(meta_filter.get("enabled", False))
                 except Exception:
                     pass
 
             if meta.get("interval") is not None and meta.get("horizon_bars") is not None:
-                imp_path = self._importance_path(
-                    str(meta.get("pattern")),
-                    str(meta.get("interval")),
-                    int(meta.get("horizon_bars")),
-                    model_name=str(meta.get("model_name")) if meta.get("model_name") else None,
-                )
-                if imp_path.exists():
+                imp_candidates = [
+                    self._importance_path_for_model_path(path),
+                    self._importance_path(
+                        str(meta.get("pattern")),
+                        str(meta.get("interval")),
+                        int(meta.get("horizon_bars")),
+                        model_name=str(meta.get("model_name")) if meta.get("model_name") else None,
+                    ),
+                ]
+                imp_path = next((candidate for candidate in imp_candidates if candidate.exists()), None)
+                if imp_path is not None and imp_path.exists():
                     row["importance_file"] = imp_path.name
 
             rows.append(row)
@@ -557,10 +697,14 @@ class PatternModelIO:
                     "test_rows",
                     "feature_count",
                     "raw_feature_count",
+                    "purged_train_rows",
+                    "candidate_models_tested",
+                    "selected_random_seed",
                     "train_end_datetime",
                     "test_start_datetime",
                     "tuned_long_threshold",
                     "tuned_short_threshold",
+                    "meta_filter_enabled",
                     "importance_file",
                 ]
             )
@@ -579,9 +723,30 @@ class PatternModelIO:
         horizon = parsed.get("horizon_bars")
         model_name = payload.get("model_name", parsed.get("model_name"))
         if pattern and interval and horizon is not None:
-            importance = self.load_feature_importance(pattern, interval, int(horizon), model_name=model_name)
+            importance = self.load_feature_importance(
+                pattern,
+                interval,
+                int(horizon),
+                model_name=model_name,
+                model_file=safe_file,
+            )
+            if importance.empty:
+                importance = self.load_feature_importance(pattern, interval, int(horizon), model_name=model_name)
             if not importance.empty:
                 importance = importance.sort_values("rank").head(top_n_importance)
+
+        meta_filter_payload = payload.get("meta_filter", {}) or {}
+        meta_filter_summary: dict[str, Any]
+        if isinstance(meta_filter_payload, dict):
+            meta_filter_summary = {
+                "enabled": bool(meta_filter_payload.get("enabled", False)),
+                "threshold": float(meta_filter_payload.get("threshold", 0.55)),
+                "train_rows": int(meta_filter_payload.get("train_rows", 0)),
+                "positive_rate": float(meta_filter_payload.get("positive_rate", 0.0)),
+                "feature_columns": list(meta_filter_payload.get("feature_columns", [])),
+            }
+        else:
+            meta_filter_summary = {"enabled": False, "threshold": 0.55, "train_rows": 0, "positive_rate": 0.0, "feature_columns": []}
 
         return {
             "model_file": safe_file,
@@ -600,6 +765,7 @@ class PatternModelIO:
             "test_start_datetime": payload.get("test_start_datetime"),
             "probability_calibration": payload.get("probability_calibration", {}),
             "tuned_thresholds": payload.get("tuned_thresholds", {}),
+            "meta_filter": meta_filter_summary,
             "importance": importance,
         }
 
@@ -614,15 +780,35 @@ def evaluate_binary(y_true: pd.Series, y_pred: np.ndarray, y_prob: np.ndarray) -
     )
 
 
-def timeseries_cv_score(x: pd.DataFrame, y: pd.Series, n_splits: int = 5, model_n_jobs: int = -1) -> float:
+def timeseries_cv_score(
+    x: pd.DataFrame,
+    y: pd.Series,
+    n_splits: int = 5,
+    model_n_jobs: int = -1,
+    purge_bars: int = 0,
+    embargo_bars: int = 0,
+) -> float:
     if len(x) < 500:
         return float("nan")
 
     splitter = TimeSeriesSplit(n_splits=n_splits)
     scores: list[float] = []
     for train_idx, test_idx in splitter.split(x):
-        x_train, x_test = x.iloc[train_idx], x.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        train_idx = np.asarray(train_idx, dtype=int)
+        test_idx = np.asarray(test_idx, dtype=int)
+        if len(test_idx) == 0:
+            continue
+        test_start = int(test_idx.min())
+        test_end = int(test_idx.max())
+        purge = max(0, int(purge_bars))
+        embargo = max(0, int(embargo_bars))
+        keep_mask = (train_idx < max(0, test_start - purge)) | (train_idx > (test_end + embargo))
+        purged_train_idx = train_idx[keep_mask]
+        if len(purged_train_idx) < 120:
+            continue
+
+        x_train, x_test = x.iloc[purged_train_idx], x.iloc[test_idx]
+        y_train, y_test = y.iloc[purged_train_idx], y.iloc[test_idx]
         model = build_stacking_classifier(random_state=42, n_jobs=model_n_jobs)
         model.fit(x_train, y_train)
         prob = model.predict_proba(x_test)[:, 1]

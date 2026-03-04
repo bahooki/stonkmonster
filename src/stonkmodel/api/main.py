@@ -6,7 +6,16 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 
-from stonkmodel.api.schemas import BacktestRequest, BuildDatasetRequest, ScanRequest, SweepIntervalsRequest, TrainRequest
+from stonkmodel.api.schemas import (
+    AutoImproveRequest,
+    BacktestRequest,
+    BuildDatasetRequest,
+    RecursiveTrainRequest,
+    ScanRequest,
+    SweepIntervalsRequest,
+    ThresholdOptimizeRequest,
+    TrainRequest,
+)
 from stonkmodel.config import get_settings
 from stonkmodel.pipeline import StonkService
 
@@ -55,8 +64,10 @@ def health() -> dict[str, str]:
 def config() -> dict[str, object]:
     payload = service.settings_dict()
     payload["fmp_api_key_set"] = bool(settings.fmp_api_key)
+    payload["fred_api_key_set"] = bool(settings.fred_api_key)
     payload["polygon_api_key_set"] = bool(settings.polygon_api_key)
     payload.pop("fmp_api_key", None)
+    payload.pop("fred_api_key", None)
     payload.pop("polygon_api_key", None)
     return payload
 
@@ -113,6 +124,97 @@ def train(payload: TrainRequest) -> dict[str, object]:
             parallel_patterns=payload.parallel_patterns,
             fast_mode=payload.fast_mode,
             max_rows_per_pattern=payload.max_rows_per_pattern,
+            include_patterns=set(payload.include_patterns or []) or None,
+            candidate_models_per_pattern=payload.candidate_models_per_pattern,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "rows": len(summary),
+        "results": _table_records(summary),
+    }
+
+
+@app.post("/train/recursive")
+def train_recursive(payload: RecursiveTrainRequest) -> dict[str, object]:
+    try:
+        summary = service.recursive_train_from_backtest(
+            dataset_name=payload.dataset_name,
+            interval=payload.interval,
+            min_pattern_rows=payload.min_pattern_rows,
+            base_model_name=payload.base_model_name,
+            rounds=payload.rounds,
+            keep_top_patterns=payload.keep_top_patterns,
+            min_trades_to_keep=payload.min_trades_to_keep,
+            parallel_patterns=payload.parallel_patterns,
+            fast_mode=payload.fast_mode,
+            max_rows_per_pattern=payload.max_rows_per_pattern,
+            candidate_models_per_pattern=payload.candidate_models_per_pattern,
+            fee_bps=payload.fee_bps,
+            spread_bps=payload.spread_bps,
+            slippage_bps=payload.slippage_bps,
+            short_borrow_bps_per_day=payload.short_borrow_bps_per_day,
+            latency_bars=payload.latency_bars,
+            min_threshold_opt_trades=payload.min_threshold_opt_trades,
+            max_eval_rows_per_pattern=payload.max_eval_rows_per_pattern,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "rows": len(summary),
+        "results": _table_records(summary),
+    }
+
+
+@app.post("/train/autopilot")
+def train_autopilot(payload: AutoImproveRequest) -> dict[str, object]:
+    try:
+        summary = service.auto_improve(
+            dataset_name=payload.dataset_name,
+            interval=payload.interval,
+            iterations=payload.iterations,
+            max_minutes=payload.max_minutes,
+            patience=payload.patience,
+            min_significant_improvement=payload.min_significant_improvement,
+            min_iteration_trades=payload.min_iteration_trades,
+            fee_bps=payload.fee_bps,
+            spread_bps=payload.spread_bps,
+            slippage_bps=payload.slippage_bps,
+            short_borrow_bps_per_day=payload.short_borrow_bps_per_day,
+            latency_bars=payload.latency_bars,
+            parallel_patterns=payload.parallel_patterns,
+            include_spread_strategies=payload.include_spread_strategies,
+            random_seed=payload.random_seed,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "rows": len(summary),
+        "results": _table_records(summary),
+    }
+
+
+@app.post("/thresholds/optimize")
+def optimize_thresholds(payload: ThresholdOptimizeRequest) -> dict[str, object]:
+    try:
+        summary = service.optimize_model_thresholds_from_backtest(
+            dataset_name=payload.dataset_name,
+            interval=payload.interval,
+            fee_bps=payload.fee_bps,
+            spread_bps=payload.spread_bps,
+            slippage_bps=payload.slippage_bps,
+            short_borrow_bps_per_day=payload.short_borrow_bps_per_day,
+            latency_bars=payload.latency_bars,
+            embargo_bars=payload.embargo_bars,
+            include_patterns=set(payload.include_patterns or []) or None,
+            include_model_files=set(payload.include_model_files or []) or None,
+            min_trades=payload.min_trades,
+            max_eval_rows_per_pattern=payload.max_eval_rows_per_pattern,
+            parallel_models=payload.parallel_models,
+            persist=payload.persist,
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -138,6 +240,7 @@ def backtest(payload: BacktestRequest) -> dict[str, object]:
             slippage_bps=payload.slippage_bps,
             short_borrow_bps_per_day=payload.short_borrow_bps_per_day,
             latency_bars=payload.latency_bars,
+            embargo_bars=payload.embargo_bars,
             train_window_days=payload.train_window_days,
             test_window_days=payload.test_window_days,
             step_days=payload.step_days,
@@ -147,6 +250,26 @@ def backtest(payload: BacktestRequest) -> dict[str, object]:
             max_eval_rows_per_pattern=payload.max_eval_rows_per_pattern,
             max_windows_per_pattern=payload.max_windows_per_pattern,
             max_train_rows_per_window=payload.max_train_rows_per_window,
+            include_portfolio=payload.include_portfolio,
+            portfolio_top_k_per_side=payload.portfolio_top_k_per_side,
+            portfolio_max_gross_exposure=payload.portfolio_max_gross_exposure,
+            portfolio_pattern_selection=payload.portfolio_pattern_selection,
+            portfolio_best_patterns_top_n=payload.portfolio_best_patterns_top_n,
+            portfolio_min_pattern_trades=payload.portfolio_min_pattern_trades,
+            portfolio_min_pattern_win_rate_trade=payload.portfolio_min_pattern_win_rate_trade,
+            portfolio_min_abs_score=payload.portfolio_min_abs_score,
+            portfolio_rebalance_every_n_bars=payload.portfolio_rebalance_every_n_bars,
+            portfolio_symbol_cooldown_bars=payload.portfolio_symbol_cooldown_bars,
+            portfolio_volatility_scaling=payload.portfolio_volatility_scaling,
+            portfolio_max_symbol_weight=payload.portfolio_max_symbol_weight,
+            include_spread_strategies=payload.include_spread_strategies,
+            spread_lookback_bars=payload.spread_lookback_bars,
+            spread_top_components=payload.spread_top_components,
+            spread_min_edge=payload.spread_min_edge,
+            spread_switch_cost_bps=payload.spread_switch_cost_bps,
+            spread_include_neutral_overlay=payload.spread_include_neutral_overlay,
+            spread_include_regime_switch=payload.spread_include_regime_switch,
+            spread_target_vol_annual=payload.spread_target_vol_annual,
             include_patterns=set(payload.include_patterns or []) or None,
             include_model_files=set(payload.include_model_files or []) or None,
         )
@@ -235,6 +358,21 @@ def feature_importance(
         "rows": len(table),
         "results": _table_records(table),
     }
+
+
+@app.get("/thresholds/recommend")
+def recommend_thresholds(
+    interval: str | None = None,
+    patterns: str | None = None,
+    model_files: str | None = None,
+) -> dict[str, object]:
+    pattern_set = {p.strip() for p in str(patterns or "").split(",") if p.strip()} or None
+    model_file_set = {m.strip() for m in str(model_files or "").split(",") if m.strip()} or None
+    return service.recommend_thresholds(
+        interval=interval,
+        include_patterns=pattern_set,
+        include_model_files=model_file_set,
+    )
 
 
 @app.post("/interval/sweep")
